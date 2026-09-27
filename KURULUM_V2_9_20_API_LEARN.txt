@@ -1,0 +1,27 @@
+ROULETTE PRO AI V2.9.20 API LEARN KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.20 API LEARN yazmalı.
+- VERİ panelinde şu iki buton görünmeli:
+  * MASA API ÖĞREN
+  * KAYITLI MASALARI API'DEN YENİLE
+
+ÖNERİLEN AKIŞ
+1. MASA API ÖĞREN'e bas.
+   Bu işlem eski masa bankası kayıtlarını sıfırlar.
+2. Tarayıcıda rulet masalarını tek tek sen aç.
+3. Program açtığın her masanın tableId/API bilgisini öğrenir.
+4. Bitince TARAMAYI DURDUR'a bas.
+5. Sonra KAYITLI MASALARI API'DEN YENİLE'ye basarak öğrendiğin temiz bankayı
+   hızlıca API'den yenile.
+
+NOT
+- BAT dosyasının adında V2_9_12 yazması normaldir.
+- Eski 61 kayıt gibi şüpheli banka sayısı MASA API ÖĞREN ile temizlenir.

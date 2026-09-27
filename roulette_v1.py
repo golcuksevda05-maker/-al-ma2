@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.18: single collector-tab click pipeline with data wait.
+# V2.9.20: manual API learn + safer scan stop.
 # Extra tab opening is disabled because some sites redirect those tabs to the
-# operator home page. The background collector tab clicks visible lobby cards
-# one by one, waits for statisticHistory/SON500 data or timeout, then returns.
+# operator home page. The collector can click visible lobby cards, while the
+# manual API learn mode lets the user open tables one by one to rebuild a clean bank.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -4370,6 +4370,15 @@ class RouletteState:
             txt += f" • {extra}"
         return txt
 
+    def clear_table_registry(self, reason=""):
+        """Clear only the visible table bank registry; archives stay on disk."""
+        with self.lock:
+            self.table_registry = {}
+            self.collector_discovered = 0
+            self.collector_refreshed = 0
+            self._save_table_registry()
+            self.background_status = self._bank_status_text(reason or "banka sıfırlandı")
+
     def mark_table_discovered(self, table_id, display_name="", source="LOBI"):
         tid = str(table_id or "").strip()
         if not tid:
@@ -6656,6 +6665,8 @@ class ChromeBridge(threading.Thread):
         self.api_refresh_remaining = []
         self.api_refresh_started = 0.0
         self.api_refresh_total = 0
+        self.manual_api_teach = False
+        self.manual_api_teach_started = 0.0
         self.live_result_probe = {}
         self.table_scan_enabled = False
         self.table_scan_visited = set()
@@ -6910,9 +6921,10 @@ class ChromeBridge(threading.Thread):
 
     def stop_table_scan(self, reason="kullanıcı durdurdu"):
         self.table_scan_enabled = False
+        self.manual_api_teach = False
         self._close_table_scan_target()
         with self.state.lock:
-            self.state.table_scan_status = f"MASA TARAMA: durdu • {reason}"
+            self.state.table_scan_status = f"MASA TARAMA/API ÖĞREN: durdu • {reason}"
         return True
 
     def _return_collector_to_lobby(self, sid, reason="sıradaki masa"):
@@ -7549,6 +7561,7 @@ class ChromeBridge(threading.Thread):
         probe_active = len(self.table_scan_probe_targets)
         probe_waiting = len(self.table_scan_probe_queue)
         scan_id_count = len(self.table_scan_found_ids)
+        remaining_clicks = max(0, len(self.table_scan_visited) - len(self.table_scan_clicked_keys))
         with self.state.lock:
             bank_count = len(self.state.table_registry)
         if (
@@ -7556,6 +7569,8 @@ class ChromeBridge(threading.Thread):
             and self.table_scan_no_progress >= 5
             and probe_active == 0
             and probe_waiting == 0
+            and remaining_clicks <= 0
+            and not self.table_scan_click_deadlines
         ):
             self.stop_table_scan(
                 f"lobi sonuna ulaşıldı • {len(self.table_scan_visited)} kart, "
@@ -7568,7 +7583,6 @@ class ChromeBridge(threading.Thread):
             if self.table_scan_found_ids
             else COLLECTOR_PROBE_INITIAL_CONCURRENT
         )
-        remaining_clicks = max(0, len(self.table_scan_visited) - len(self.table_scan_clicked_keys))
         probe_text = (
             f"ek sekme hattı {probe_active}/{active_limit} aktif {probe_waiting} bekliyor • "
             if active_limit > 0
@@ -7798,8 +7812,16 @@ class ChromeBridge(threading.Thread):
             self.state.mark_table_discovered(
                 table_id,
                 display_name=title,
-                source="AÇIK PRAGMATIC MASA",
+                source="API ÖĞREN" if self.manual_api_teach else "AÇIK PRAGMATIC MASA",
             )
+
+        if self.manual_api_teach:
+            with self.state.lock:
+                learned_count = len(self.state.table_registry)
+                self.state.table_scan_status = (
+                    f"MASA API ÖĞREN: {learned_count} masa öğrendi • "
+                    f"son: {title[:42]} • SON500/API bekleniyor"
+                )
 
         if self._is_collector_session(sid):
             self.table_scan_found_ids.add(table_id)
@@ -8352,6 +8374,22 @@ class ChromeBridge(threading.Thread):
             name="PragmaticMultiTableCollector",
             daemon=True,
         ).start()
+        return True
+
+    def start_manual_api_teach(self):
+        """Reset the visible bank and learn table APIs while user opens tables."""
+        self.table_scan_enabled = False
+        self._close_table_scan_target()
+        self.manual_api_teach = True
+        self.manual_api_teach_started = time.time()
+        self.collector_seen.clear()
+        self.direct_api_seen.clear()
+        self.state.clear_table_registry("API öğren başladı")
+        with self.state.lock:
+            self.state.table_scan_status = (
+                "MASA API ÖĞREN: açık • bankayı sıfırladım • "
+                "masaları tek tek sen aç, API/tableId kaydedilecek"
+            )
         return True
 
     def start_api_refresh_all(self):
@@ -9340,7 +9378,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.19 • API Bank Refresh")
+        self.root.title("Roulette Pro AI V2.9.20 • API Learn")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9511,7 +9549,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.19 API REFRESH",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.20 API LEARN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -9755,11 +9793,17 @@ class App:
         api_bar=tk.Frame(data,bg=self.PANEL)
         api_bar.pack(fill="x",padx=8,pady=(0,5))
         tk.Button(
+            api_bar,text="MASA API ÖĞREN",command=self.start_api_teach_ui,
+            font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.GREEN,
+            activebackground=self.PANEL2,activeforeground=self.GREEN,
+            relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
+        ).pack(side="left",fill="x",expand=True,padx=(0,2))
+        tk.Button(
             api_bar,text="KAYITLI MASALARI API'DEN YENİLE",command=self.start_api_refresh_ui,
             font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.YELLOW,
             activebackground=self.PANEL2,activeforeground=self.GREEN,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
-        ).pack(fill="x",expand=True)
+        ).pack(side="left",fill="x",expand=True,padx=(2,0))
         self.history_brain_line=tk.Label(data,text="Geçmiş sinyali bekleniyor...",font=("Consolas",8),justify="left",anchor="w",fg=self.TEXT,bg=self.PANEL,wraplength=380)
         self.history_brain_line.pack(fill="x",padx=8,pady=(0,6))
 
@@ -10643,6 +10687,21 @@ class App:
 
     def start_api_refresh_ui(self):
         self.bridge.start_api_refresh_all()
+
+    def start_api_teach_ui(self):
+        self.bridge.start_manual_api_teach()
+        try:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Masa API Öğren",
+                "Masa bankası sıfırlandı.\n\n"
+                "Şimdi tarayıcıda rulet masalarını tek tek sen aç.\n"
+                "Program her açtığın Pragmatic masanın tableId/API bilgisini "
+                "kaydedip SON500 verisini almaya çalışacak.\n\n"
+                "Bitince TARAMAYI DURDUR düğmesine basabilirsin."
+            )
+        except Exception:
+            pass
 
     def reset_lobby_teach_ui(self):
         self.bridge.reset_lobby_teaching()
