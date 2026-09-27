@@ -30,10 +30,9 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.20: manual API learn + safer scan stop.
-# Extra tab opening is disabled because some sites redirect those tabs to the
-# operator home page. The collector can click visible lobby cards, while the
-# manual API learn mode lets the user open tables one by one to rebuild a clean bank.
+# V2.9.21: clean API learn + background refresh status.
+# Manual API learn records only actual opened Pragmatic tables, not bulk lobby
+# catalog rows, so the bank count matches the user's visited table count.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -6665,6 +6664,8 @@ class ChromeBridge(threading.Thread):
         self.api_refresh_remaining = []
         self.api_refresh_started = 0.0
         self.api_refresh_total = 0
+        self.api_refresh_success = 0
+        self.api_refresh_fail = 0
         self.manual_api_teach = False
         self.manual_api_teach_started = 0.0
         self.live_result_probe = {}
@@ -8342,6 +8343,9 @@ class ChromeBridge(threading.Thread):
                     source_label="MULTI TABLE statisticHistory",
                 )
                 self.state.mark_table_attempt(tid, ok=True)
+                if self.api_refresh_mode:
+                    with self.collector_lock:
+                        self.api_refresh_success = int(self.api_refresh_success or 0) + 1
                 if self.table_scan_enabled and tid in self.table_scan_found_ids:
                     now_done = time.time()
                     for scan_sid in list(self.table_scan_click_deadlines.keys()):
@@ -8354,6 +8358,9 @@ class ChromeBridge(threading.Thread):
                             f"MASA TARAMA: veri alındı • {tid} • sıradaki masaya geçiliyor"
                         )
             except Exception as exc:
+                if self.api_refresh_mode:
+                    with self.collector_lock:
+                        self.api_refresh_fail = int(self.api_refresh_fail or 0) + 1
                 if self.table_scan_enabled and tid in self.table_scan_found_ids:
                     now_fail = time.time()
                     for scan_sid in list(self.table_scan_click_deadlines.keys()):
@@ -8429,6 +8436,8 @@ class ChromeBridge(threading.Thread):
             self.api_refresh_remaining = rows
             self.api_refresh_total = len(rows)
             self.api_refresh_started = now
+            self.api_refresh_success = 0
+            self.api_refresh_fail = 0
             self.api_refresh_mode = bool(rows and templates)
         with self.state.lock:
             if not rows:
@@ -8461,7 +8470,16 @@ class ChromeBridge(threading.Thread):
         template = templates[0]
         with self.collector_lock:
             available = COLLECTOR_MAX_CONCURRENT - len(self.collector_inflight)
+            inflight_now = len(self.collector_inflight)
+            ok_now = int(getattr(self, "api_refresh_success", 0) or 0)
+            fail_now = int(getattr(self, "api_refresh_fail", 0) or 0)
         if available <= 0:
+            if api_mode:
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: çalışıyor • OK {ok_now} / HATA {fail_now} • "
+                        f"{inflight_now} aktif • {len(api_remaining)} bekliyor"
+                    )
             return
 
         if api_mode:
@@ -8487,17 +8505,20 @@ class ChromeBridge(threading.Thread):
                 self.api_refresh_remaining = kept
                 remaining = len(self.api_refresh_remaining)
                 inflight = len(self.collector_inflight)
+                ok_now = int(getattr(self, "api_refresh_success", 0) or 0)
+                fail_now = int(getattr(self, "api_refresh_fail", 0) or 0)
                 if remaining == 0 and inflight == 0:
                     self.api_refresh_mode = False
             done = max(0, api_total - remaining)
             with self.state.lock:
                 if remaining == 0 and inflight == 0:
                     self.state.table_scan_status = (
-                        f"API TOPLA: tamamlandı • {done}/{api_total} masa denendi"
+                        f"API TOPLA: tamamlandı • OK {ok_now} / HATA {fail_now} • "
+                        f"{done}/{api_total} masa denendi"
                     )
                 else:
                     self.state.table_scan_status = (
-                        f"API TOPLA: {done}/{api_total} gönderildi • "
+                        f"API TOPLA: {done}/{api_total} gönderildi • OK {ok_now} / HATA {fail_now} • "
                         f"{inflight} aktif • {remaining} bekliyor"
                     )
             return
@@ -8732,7 +8753,7 @@ class ChromeBridge(threading.Thread):
 
             meta = context if isinstance(context, dict) else {}
             discovered = extract_pragmatic_roulette_tables(body)
-            if discovered:
+            if discovered and not self.manual_api_teach:
                 source_url = urllib.parse.urlsplit(str(meta.get("url") or ""))
                 source_label = (
                     f"{source_url.scheme}://{source_url.netloc}{source_url.path}"
@@ -9378,7 +9399,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.20 • API Learn")
+        self.root.title("Roulette Pro AI V2.9.21 • Clean API Learn")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9549,7 +9570,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.20 API LEARN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.21 CLEAN API",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -9684,8 +9705,10 @@ class App:
             relief="flat",bd=0,padx=5,pady=1,cursor="hand2",
         ).pack(pady=(0,2))
 
+        # V2.9.21: old learned-route controls are hidden from the main screen.
+        # Widgets still exist for compatibility, but are not packed.
         teach_bar=tk.Frame(master,bg=self.PANEL)
-        teach_bar.pack(fill="x",padx=8,pady=(1,2))
+        # teach_bar.pack(fill="x",padx=8,pady=(1,2))
         tk.Button(
             teach_bar,
             text="ÖĞREN BAŞLAT",
@@ -9730,7 +9753,7 @@ class App:
             fg=self.BLUE,bg=self.PANEL,
             wraplength=390,
         )
-        self.lobby_teach_line.pack(pady=(0,1))
+        # self.lobby_teach_line.pack(pady=(0,1))
 
         self.chrome_link_line=tk.Label(
             master,
@@ -9739,7 +9762,7 @@ class App:
             fg=self.YELLOW,bg=self.PANEL,
             wraplength=390,
         )
-        self.chrome_link_line.pack(pady=(0,2))
+        # self.chrome_link_line.pack(pady=(0,2))
 
         self.top_last_line = tk.Label(master,text="SON: --",font=("Segoe UI",8,"bold"),fg=self.MUTED,bg=self.PANEL)
         self.top_last_line.pack(pady=(1,7))
@@ -10869,8 +10892,7 @@ class App:
                 f"CANLI SYNC: {s.get('source','-')}\n"
                 f"SON500 LIVE: SADECE DOĞRULANMIŞ +YENİ\n"
                 f"PUANLAMA: {s.get('score_error_status','OK')}\n"
-                f"{s.get('autorecover_status','AUTO KURTARMA: HAZIR')}\n"
-                f"{s.get('autolobby_status','AUTO LOBİ: HAZIR')}"
+                f"{s.get('autorecover_status','AUTO KURTARMA: HAZIR')}"
             ))
 
             sc = s.get("source_consensus") or {}
