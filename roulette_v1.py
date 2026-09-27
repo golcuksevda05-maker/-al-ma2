@@ -30,8 +30,12 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-COLLECTOR_PROBE_MAX_CONCURRENT = 2
-COLLECTOR_PROBE_SECONDS = 28.0
+# V2.9.15: hidden card-opening probes are disabled by default.
+# They created extra Pragmatic Lobby tabs on some sites and could stay on the
+# provider splash screen. Table discovery now uses lobby DOM/network metadata
+# and direct statisticHistory templates only.
+COLLECTOR_PROBE_MAX_CONCURRENT = 0
+COLLECTOR_PROBE_SECONDS = 12.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -4357,7 +4361,7 @@ class RouletteState:
                 pass
         self.collector_refreshed = refreshed
         txt = (
-            f"ÇOKLU TOPLAYICI: {active} aktif • {refreshed}/{bank_count} güncel"
+            f"MASA BANKASI: {bank_count} kayıt • {refreshed} son 5dk güncel"
             f" • {total} spin"
         )
         if extra:
@@ -6524,17 +6528,9 @@ def build_multi_table_nav_scan():
       }} catch (_) {{}}
     }}
 
-    // Many operator lobbies expose only data-gameid. Build a safe operator
-    // deep link so the collector can open the card in a hidden tab and let
-    // Pragmatic's own network calls reveal the real tableId.
-    if (!href && gameId) {{
-      try {{
-        const u=new URL(location.href);
-        u.searchParams.set('openGames', gameId);
-        u.searchParams.set('gameNames', label.replace(/\s+/g,' ').slice(0,120));
-        href=u.toString();
-      }} catch (_) {{}}
-    }}
+    // V2.9.15: do not synthesize/open deep links from data-gameid.
+    // Some sites show a black Pragmatic splash forever in background tabs.
+    // If a real tableId is not visible, we wait for lobby/network metadata.
 
     const key=(tableId || gameId || href || label+'|'+testid).slice(0,420);
     if (!key || seen.has(key)) continue;
@@ -6884,6 +6880,8 @@ class ChromeBridge(threading.Thread):
     def _queue_table_probe(self, row):
         if not isinstance(row, dict):
             return False
+        if COLLECTOR_PROBE_MAX_CONCURRENT <= 0:
+            return False
         url = str(row.get("href") or "").strip()
         label = str(row.get("label") or "").strip()
         key = str(row.get("key") or url or label).strip()
@@ -6909,6 +6907,9 @@ class ChromeBridge(threading.Thread):
         if not self.table_scan_enabled or self.ws is None:
             return
         self._cleanup_table_scan_probes()
+        if COLLECTOR_PROBE_MAX_CONCURRENT <= 0:
+            self.table_scan_probe_queue = []
+            return
         active = len(self.table_scan_probe_targets)
         while active < COLLECTOR_PROBE_MAX_CONCURRENT and self.table_scan_probe_queue:
             row = self.table_scan_probe_queue.pop(0)
@@ -7401,16 +7402,21 @@ class ChromeBridge(threading.Thread):
         ):
             self.stop_table_scan(
                 f"lobi sonuna ulaşıldı • {len(self.table_scan_visited)} kart, "
-                f"bu taramada {scan_id_count} masa ID • banka {bank_count}"
+                f"bu taramada {scan_id_count} gerçek masa ID • kayıtlı banka {bank_count}"
             )
             return
 
+        probe_text = (
+            f"gizli tanıma {probe_active} aktif {probe_waiting} bekliyor • "
+            if COLLECTOR_PROBE_MAX_CONCURRENT > 0
+            else "gizli sekme açma kapalı • "
+        )
         with self.state.lock:
             self.state.table_scan_status = (
                 "MASA TARAMA: Rulet lobisi • "
-                f"{len(self.table_scan_visited)} kart / bu taramada {scan_id_count} masa ID "
-                f"/ banka {bank_count} • "
-                f"giriş deneme {probe_active} aktif {probe_waiting} bekliyor • "
+                f"{len(self.table_scan_visited)} kart / bu taramada {scan_id_count} gerçek masa ID "
+                f"/ kayıtlı banka {bank_count} • "
+                f"{probe_text}"
                 f"kaydırma {min(scroll_top + client_height, scroll_height)}/"
                 f"{scroll_height or 'bekleniyor'}"
             )
@@ -8999,7 +9005,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.14 • Scan Fix + Risk EV")
+        self.root.title("Roulette Pro AI V2.9.15 • Safe Scan + Risk EV")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9170,7 +9176,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.14 SCAN+RISK",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.15 SAFE SCAN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
