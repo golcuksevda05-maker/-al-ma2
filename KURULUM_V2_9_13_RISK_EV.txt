@@ -1,0 +1,25 @@
+ROULETTE PRO AI V2.9.13 RISK+EV KURULUM
+
+Eğer indirdiğin dosya adı şuna benziyorsa:
+01a0e3c2-5250-723b-89f8-5f5b872b1aae
+
+Bu normaldir. Arena/GitHub indirme sırasında dosyaya geçici bir kimlik adı verebilir.
+İstersen dosya veya klasör adını değiştirebilirsin.
+
+KURULUM ADIMLARI
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. Çıkan klasörün içindeki dosyaları kendi program klasörüne kopyala.
+3. Sorarsa roulette_v1.py dosyasını değiştir / üzerine yaz.
+4. Programı yine aynı BAT dosyasıyla çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+ÖNEMLİ
+- BAT dosyasının adının V2.9.12 kalması sorun değil.
+- Güncel program başlığında V2.9.13 RISK+EV yazmalı.
+- ZIP/RAR penceresinin içinden çalıştırma. Önce tamamen klasöre çıkar.
+
+BU PAKETTEKİ ANA DOSYALAR
+- roulette_v1.py  -> asıl güncel program kodu
+- resolve_last_roulette.py -> yardımcı dosya
+- BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat -> çalıştırma dosyası
+- README_V2_9_13_RISK_EV.txt -> yeni risk paneli açıklaması

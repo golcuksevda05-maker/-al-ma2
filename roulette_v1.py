@@ -2351,6 +2351,113 @@ def locked_live_profiles(locked):
         "200":locked_live_summary(rows,200),
     }
 
+
+def straight_up_risk_profile(label, hits=0, trials=0, coverage=1.0, coverage_sum=None):
+    """
+    Straight-up roulette risk view for equal 1-unit bets on covered numbers.
+
+    It separates model hit performance from unavoidable European roulette
+    payout math. A hit on any covered number returns net profit (36-coverage)
+    units for that round; a miss loses coverage units. Therefore the break-even
+    hit rate is coverage/36, while random European roulette hit rate is
+    coverage/37.
+    """
+    n = max(0, int(trials or 0))
+    h = max(0, int(hits or 0))
+
+    if coverage_sum is None:
+        cov_sum = max(0.0, float(coverage or 0.0)) * n
+        avg_cov = max(0.0, float(coverage or 0.0))
+    else:
+        cov_sum = max(0.0, float(coverage_sum or 0.0))
+        avg_cov = (cov_sum / n) if n else max(0.0, float(coverage or 0.0))
+
+    random_hit = (avg_cov / 37.0 * 100.0) if avg_cov else 0.0
+    breakeven = (avg_cov / 36.0 * 100.0) if avg_cov else 0.0
+    required_edge = breakeven - random_hit
+    random_ev_round = -avg_cov / 37.0 if avg_cov else 0.0
+    random_roi = -100.0 / 37.0 if avg_cov else 0.0
+
+    if n and cov_sum > 0.0:
+        hit_rate = h / n * 100.0
+        profit_units = h * 36.0 - cov_sum
+        roi = profit_units / cov_sum * 100.0
+        low90 = wilson_lower_bound(h, n) * 100.0
+
+        if avg_cov > 36.0:
+            status = "BAŞABAŞ İMKANSIZ"
+        elif low90 >= breakeven and n >= 40:
+            status = "KANITLI ARTI"
+        elif hit_rate >= breakeven:
+            status = "ARTI AMA ERKEN"
+        elif hit_rate < random_hit:
+            status = "TABAN ALTI"
+        else:
+            status = "BAŞABAŞ ALTI"
+    else:
+        hit_rate = 0.0
+        profit_units = 0.0
+        roi = 0.0
+        low90 = 0.0
+        status = "VERİ BEKLİYOR"
+
+    return {
+        "label": str(label),
+        "trials": n,
+        "hits": h,
+        "avg_coverage": float(avg_cov),
+        "coverage_sum": float(cov_sum),
+        "random_hit_pct": float(random_hit),
+        "breakeven_hit_pct": float(breakeven),
+        "required_edge_pp": float(required_edge),
+        "random_ev_units_per_round": float(random_ev_round),
+        "random_roi_pct": float(random_roi),
+        "hit_rate_pct": float(hit_rate),
+        "profit_units": float(profit_units),
+        "roi_pct": float(roi),
+        "wilson_low90_pct": float(low90),
+        "status": status,
+    }
+
+
+def risk_analysis_snapshot(validation, neighbor1_total=None, neighbor2_total=None):
+    """Current model/risk metrics for the visible straight-up plans."""
+    validation = validation or {}
+    n = int(validation.get("trials", 0) or 0)
+
+    def nb_profile(label, total):
+        total = total or {}
+        tn = int(total.get("trials", 0) or 0)
+        hits = int(total.get("any_hits", 0) or 0)
+        cov_sum = float(total.get("coverage_sum", 0.0) or 0.0)
+        avg_cov = (cov_sum / tn) if tn else 0.0
+        return straight_up_risk_profile(
+            label,
+            hits=hits,
+            trials=tn,
+            coverage=avg_cov,
+            coverage_sum=cov_sum,
+        )
+
+    return {
+        "note": "35:1 düz sayı matematiği; garanti/gerçek olasılık değildir.",
+        "net": straight_up_risk_profile(
+            "NET",
+            hits=int(validation.get("exact", 0) or 0),
+            trials=n,
+            coverage=1.0,
+        ),
+        "top5": straight_up_risk_profile(
+            "NET+YEDEK TOP5",
+            hits=int(validation.get("top5", 0) or 0),
+            trials=n,
+            coverage=5.0,
+        ),
+        "k1": nb_profile("K1 PAKET", neighbor1_total),
+        "k2": nb_profile("K2 PAKET", neighbor2_total),
+    }
+
+
 def exact_window_profiles(validation_history, source_hits=None, expert_hits=None):
     """
     Exact-number performance only:
@@ -5903,6 +6010,11 @@ class RouletteState:
                     "count": len((self.locked_live or {}).get("rows") or []),
                     "profiles": locked_live_profiles(self.locked_live),
                 },
+                "risk_profile": risk_analysis_snapshot(
+                    self.validation,
+                    self.neighbor1_stats_total,
+                    self.neighbor_stats_total,
+                ),
                 "comparison_batch_count": len(self.display_compare_batch),
                 "neighbor_records": neighbor_records,
                 "neighbor_stats": neighbor_stats,
@@ -8833,7 +8945,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.12 MENU+SCROLL",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.13 RISK+EV",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -9097,7 +9209,13 @@ class App:
             font=("Consolas",8,"bold"),justify="left",anchor="w",
             fg=self.YELLOW,bg=self.PANEL,wraplength=380,
         )
-        self.locked_line.pack(fill="x",padx=8,pady=(0,6))
+        self.locked_line.pack(fill="x",padx=8,pady=(0,2))
+        self.risk_line=tk.Label(
+            perf,text="RİSK/EV: veri bekleniyor",
+            font=("Consolas",8,"bold"),justify="left",anchor="w",
+            fg=self.YELLOW,bg=self.PANEL,wraplength=380,
+        )
+        self.risk_line.pack(fill="x",padx=8,pady=(0,6))
 
         hist_shell,hist=self._detail_frame(); self.detail_frames["history"]=hist_shell
         top=tk.Frame(hist,bg=self.PANEL); top.pack(fill="x",padx=8,pady=(5,1))
@@ -10323,6 +10441,55 @@ class App:
                     fg=self.YELLOW,
                 )
 
+            risk = s.get("risk_profile") or {}
+
+            def risk_text(row):
+                row = row or {}
+                label = str(row.get("label") or "-")
+                trials_r = int(row.get("trials", 0) or 0)
+                base = float(row.get("random_hit_pct", 0.0) or 0.0)
+                be = float(row.get("breakeven_hit_pct", 0.0) or 0.0)
+                cov_r = float(row.get("avg_coverage", 0.0) or 0.0)
+                if trials_r:
+                    hit = float(row.get("hit_rate_pct", 0.0) or 0.0)
+                    roi = float(row.get("roi_pct", 0.0) or 0.0)
+                    low = float(row.get("wilson_low90_pct", 0.0) or 0.0)
+                    return (
+                        f"{label}: K {cov_r:.1f}/37 • %{hit:.1f} "
+                        f"(alt90 %{low:.1f}) • BE %{be:.1f} • ROI {roi:+.1f}% • "
+                        f"{row.get('status','')}"
+                    )
+                return f"{label}: K {cov_r:.1f}/37 • taban %{base:.1f} • BE %{be:.1f}"
+
+            rnet = risk.get("net") or {}
+            rtop5 = risk.get("top5") or {}
+            rk1 = risk.get("k1") or {}
+            rk2 = risk.get("k2") or {}
+            risk_lines = [
+                "RİSK/EV: düz sayı 35:1 • rastgele uzun vade ROI -%2.70",
+                risk_text(rnet),
+                risk_text(rtop5),
+            ]
+            if int(rk1.get("trials", 0) or 0) or int(rk2.get("trials", 0) or 0):
+                risk_lines.append(risk_text(rk1))
+                risk_lines.append(risk_text(rk2))
+            else:
+                risk_lines.append("K1/K2: canlı paket ROI için doğrulanmış tur bekleniyor")
+
+            statuses = [
+                str(row.get("status") or "")
+                for row in (rnet, rtop5, rk1, rk2)
+                if int(row.get("trials", 0) or 0)
+            ]
+            self.risk_line.config(
+                text="\n".join(risk_lines),
+                fg=(
+                    self.GREEN if any("KANITLI" in x for x in statuses)
+                    else self.RED if statuses and all("TABAN ALTI" in x for x in statuses)
+                    else self.YELLOW
+                ),
+            )
+
             w = s.get("weights") or {}
             self.weight_line.config(text=(
                 f"Öğrenme: {s.get('learning_spins',0)} spin • "
@@ -10385,6 +10552,7 @@ class App:
             self.recent20_line.config(text="")
             self.walkforward_line.config(text="WALK-FORWARD: veri bekleniyor", fg=self.BLUE)
             self.locked_line.config(text="LOCKED LIVE 0/500 • yeni tur bekleniyor", fg=self.YELLOW)
+            self.risk_line.config(text="RİSK/EV: veri bekleniyor", fg=self.YELLOW)
             self.weight_line.config(text="")
             self.expert_line.config(text="")
 
@@ -10960,6 +11128,14 @@ def self_test():
     ext = external_web_expert([17, 34, 7], PUBLIC_AUTO_SEED_NEWEST)
     assert abs(sum(ext.values()) - 1.0) < 1e-9
     assert set(ext.keys()) == set(range(37))
+
+    # Risk/EV math: five straight-up numbers break even at 5/36,
+    # while random European coverage is 5/37 and ROI is -1/37 per stake unit.
+    rp = straight_up_risk_profile("T5", hits=14, trials=100, coverage=5)
+    assert abs(rp["random_hit_pct"] - (5/37*100)) < 1e-9
+    assert abs(rp["breakeven_hit_pct"] - (5/36*100)) < 1e-9
+    assert abs(rp["random_roi_pct"] + (100/37)) < 1e-9
+    assert rp["roi_pct"] > 0.0
 
     # V2.9.1 unattended recovery message tests.
     r1 = recovery_text_score("Bağlantı hatası. Lütfen sayfayı yenileyin.", ["Yenile"])
