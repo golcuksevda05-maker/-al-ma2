@@ -30,13 +30,15 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.22: Chrome-runtime API refresh.
-# API refresh first fetches statisticHistory inside the authenticated Chrome
-# Pragmatic context, then falls back to Python HTTP if needed.
+# V2.9.23: lobby auto collector fallback.
+# If API refresh cannot read data, the program opens a dedicated Pragmatic
+# lobby collector tab, clicks visible roulette cards one by one, stores SON500,
+# and repeats every 10 minutes.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
 COLLECTOR_CARD_CLICK_SECONDS = 10.0
+TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -6745,6 +6747,8 @@ class ChromeBridge(threading.Thread):
         self.table_scan_last_view = 0.0
         self.table_scan_target_id = ""
         self.table_scan_entry_url = ""
+        self.table_scan_auto_cycle = False
+        self.table_scan_next_cycle = 0.0
         self.table_scan_probe_queue = []
         self.table_scan_probe_targets = {}
         self.table_scan_probe_urls = set()
@@ -6958,8 +6962,10 @@ class ChromeBridge(threading.Thread):
                 except Exception:
                     pass
 
-    def start_table_scan(self):
+    def start_table_scan(self, auto_cycle=True):
         self._close_table_scan_target()
+        self.table_scan_auto_cycle = bool(auto_cycle)
+        self.table_scan_next_cycle = 0.0
         self.table_scan_enabled = True
         self.table_scan_visited = set()
         self.table_scan_found_ids = set()
@@ -6988,11 +6994,22 @@ class ChromeBridge(threading.Thread):
         return True
 
     def stop_table_scan(self, reason="kullanıcı durdurdu"):
+        manual_stop = "kullanıcı" in str(reason).lower()
         self.table_scan_enabled = False
         self.manual_api_teach = False
         self._close_table_scan_target()
+        if manual_stop:
+            self.table_scan_auto_cycle = False
+            self.table_scan_next_cycle = 0.0
+        elif self.table_scan_auto_cycle:
+            self.table_scan_next_cycle = time.time() + TABLE_SCAN_AUTO_REFRESH_SECONDS
         with self.state.lock:
-            self.state.table_scan_status = f"MASA TARAMA/API ÖĞREN: durdu • {reason}"
+            if self.table_scan_auto_cycle and not manual_stop:
+                self.state.table_scan_status = (
+                    f"MASA TARAMA: {reason} • 10 dk sonra otomatik tekrar"
+                )
+            else:
+                self.state.table_scan_status = f"MASA TARAMA/API ÖĞREN: durdu • {reason}"
         return True
 
     def _return_collector_to_lobby(self, sid, reason="sıradaki masa"):
@@ -7986,6 +8003,15 @@ class ChromeBridge(threading.Thread):
             try:
                 now = time.time()
 
+                if (
+                    self.table_scan_auto_cycle
+                    and not self.table_scan_enabled
+                    and not self.manual_api_teach
+                    and float(self.table_scan_next_cycle or 0.0) > 0.0
+                    and now >= float(self.table_scan_next_cycle or 0.0)
+                ):
+                    self.start_table_scan(auto_cycle=True)
+
                 # V2.9.5 ÖĞRET MODU:
                 # No blind scrolling and no generic text-based wandering.
                 # During training we only observe the user's own four clicks.
@@ -8453,6 +8479,8 @@ class ChromeBridge(threading.Thread):
     def start_manual_api_teach(self):
         """Reset the visible bank and learn table APIs while user opens tables."""
         self.table_scan_enabled = False
+        self.table_scan_auto_cycle = False
+        self.table_scan_next_cycle = 0.0
         self._close_table_scan_target()
         self.manual_api_teach = True
         self.manual_api_teach_started = time.time()
@@ -8658,8 +8686,14 @@ class ChromeBridge(threading.Thread):
                 if remaining == 0 and inflight == 0:
                     self.api_refresh_mode = False
             done = max(0, api_total - remaining)
+            fallback_lobby = bool(remaining == 0 and inflight == 0 and ok_now == 0 and fail_now > 0)
             with self.state.lock:
-                if remaining == 0 and inflight == 0:
+                if fallback_lobby:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: OK 0 / HATA {fail_now} • "
+                        "lobi sekme toplayıcıya geçiliyor"
+                    )
+                elif remaining == 0 and inflight == 0:
                     self.state.table_scan_status = (
                         f"API TOPLA: tamamlandı • OK {ok_now} / HATA {fail_now} • "
                         f"{done}/{api_total} masa denendi"
@@ -8669,6 +8703,8 @@ class ChromeBridge(threading.Thread):
                         f"API TOPLA: {done}/{api_total} gönderildi • OK {ok_now} / HATA {fail_now} • "
                         f"{inflight} aktif • {remaining} bekliyor"
                     )
+            if fallback_lobby:
+                self.start_table_scan(auto_cycle=True)
             return
 
         candidates.sort(key=lambda row: float(row.get("last_requested", 0.0) or 0.0))
@@ -9587,7 +9623,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.22 • Runtime API")
+        self.root.title("Roulette Pro AI V2.9.23 • Lobby Auto Collector")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9758,7 +9794,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.22 RUNTIME API",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.23 LOBBY AUTO",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
