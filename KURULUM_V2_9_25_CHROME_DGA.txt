@@ -1,0 +1,29 @@
+ROULETTE PRO AI V2.9.25 CHROME DGA KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.25 CHROME DGA yazmalı.
+
+KULLANIM
+1. Chrome'da en az bir Pragmatic rulet masası veya Pragmatic lobi açık olsun.
+2. Programda şu düğmeye bas:
+   KAYITLI MASALARI DGA CANLI YENİLE
+   veya
+   DGA CANLI / MASALARI TARA
+3. Durum satırında önce şunu görmelisin:
+   CHROME DGA: Chrome içinde websocket açılıyor
+4. Sonra şunlardan biri görünür:
+   CHROME DGA: başlatıldı
+   CHROME DGA: open • ... abonelik • ... frame • veri bekliyor
+   DGA CANLI: Chrome feed veri aldı
+5. Durdurmak için TARAMAYI DURDUR'a bas.
+
+ÖNEMLİ
+- V2.9.24'teki ConnectionResetError için ana düzeltme budur.
+- DGA WebSocket artık öncelikle Chrome Runtime içinden açılır.

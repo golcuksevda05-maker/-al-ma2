@@ -31,11 +31,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.24: Pragmatic DGA WebSocket collector.
-# GitHub research showed the stable multi-table feed is the Pragmatic Live
-# websocket (wss://dga.pragmaticplaylive.net/ws) with subscribe messages.
-# The program now learns casinoId/currency from Chrome websocket frames and
-# refreshes learned table banks from the feed before falling back to lobby clicks.
+# V2.9.25: Chrome Runtime DGA feed.
+# If direct Python WebSocket is reset by the operator/network, DGA is opened
+# inside Chrome's active Pragmatic page context. This preserves browser origin
+# and avoids the old API/lobby-click dead ends.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -6940,29 +6939,20 @@ class DgaLiveFeedCollector(threading.Thread):
         if not ids:
             return 0
         sent = 0
-        if individual:
-            for tid in ids:
-                msg = {
-                    "type": "subscribe",
-                    "isDeltaEnabled": True,
-                    "casinoId": casino_id,
-                    "key": tid,
-                    "currency": currency,
-                }
-                ws.send_text(json.dumps(msg, separators=(",", ":")))
-                sent += 1
-            return sent
-        for i in range(0, len(ids), max(1, int(DGA_SUBSCRIBE_BATCH_SIZE))):
-            batch = ids[i:i + max(1, int(DGA_SUBSCRIBE_BATCH_SIZE))]
+        # Pragmatic examples differ: some use key:"tableId", some use
+        # key:["tableId"]. Large multi-key batches caused ConnectionResetError
+        # for the user's operator, so the fallback path now sends one table per
+        # subscribe frame.
+        for tid in ids:
             msg = {
                 "type": "subscribe",
                 "isDeltaEnabled": True,
                 "casinoId": casino_id,
-                "key": batch,
+                "key": [tid] if individual else tid,
                 "currency": currency,
             }
             ws.send_text(json.dumps(msg, separators=(",", ":")))
-            sent += len(batch)
+            sent += 1
         return sent
 
     def _handle_payload(self, payload, display_names=None):
@@ -7121,6 +7111,215 @@ class DgaLiveFeedCollector(threading.Thread):
                 time.sleep(1.0)
 
 
+def build_chrome_dga_start_script(rows, casino_id="", currency="", ws_url=""):
+    rows_json = json.dumps(rows or [], ensure_ascii=False)
+    casino_json = json.dumps(str(casino_id or ""), ensure_ascii=False)
+    currency_json = json.dumps(str(currency or ""), ensure_ascii=False)
+    ws_json = json.dumps(str(ws_url or DGA_FEED_WS_URL), ensure_ascii=False)
+    return f"""
+(() => {{
+  const rows = {rows_json};
+  const cfg = {{
+    wsUrl: {ws_json} || 'wss://dga.pragmaticplaylive.net/ws',
+    casinoId: {casino_json} || '',
+    currency: ({currency_json} || '').toUpperCase()
+  }};
+  const norm = v => String(v == null ? '' : v).trim();
+  function storageBlob() {{
+    const out=[];
+    for (const store of [window.localStorage, window.sessionStorage]) {{
+      try {{
+        for (let i=0;i<store.length;i++) {{
+          const k=store.key(i);
+          if (!k) continue;
+          const v=store.getItem(k);
+          if (/(casino|currency|table|dga|pragmatic)/i.test(k+' '+String(v).slice(0,500))) {{
+            out.push(k+'='+String(v).slice(0,1000));
+          }}
+        }}
+      }} catch (_) {{}}
+    }}
+    return out.join('\n');
+  }}
+  const resourceBlob = (() => {{
+    try {{ return performance.getEntriesByType('resource').map(x => x.name || '').join('\n'); }}
+    catch (_) {{ return ''; }}
+  }})();
+  const allText = [location.href, document.title || '', resourceBlob, storageBlob()].join('\n');
+  function firstMatch(patterns) {{
+    for (const re of patterns) {{
+      const m = allText.match(re);
+      if (m && m[1]) return decodeURIComponent(String(m[1])).trim();
+    }}
+    return '';
+  }}
+  if (!cfg.casinoId) {{
+    cfg.casinoId = firstMatch([
+      /[?&]casinoId=([^&#\s]+)/i,
+      /[?&]casinoID=([^&#\s]+)/i,
+      /["']casinoId["']\s*[:=]\s*["']([^"']+)/i,
+      /["']casinoID["']\s*[:=]\s*["']([^"']+)/i,
+      /casinoId\s*[:=]\s*([A-Za-z0-9_-]{{6,}})/i
+    ]);
+  }}
+  if (!cfg.currency) {{
+    cfg.currency = firstMatch([
+      /[?&]currency=([^&#\s]+)/i,
+      /[?&]currencyId=([^&#\s]+)/i,
+      /["']currency["']\s*[:=]\s*["']([^"']+)/i,
+      /["']currencyId["']\s*[:=]\s*["']([^"']+)/i,
+      /currency\s*[:=]\s*([A-Z]{{3}})/i
+    ]).toUpperCase();
+  }}
+  if (!cfg.casinoId) cfg.casinoId = 'ppcds00000003709';
+  if (!cfg.currency) cfg.currency = 'TRY';
+
+  const ids = Array.from(new Set(rows.map(r => norm(r.table_id)).filter(Boolean)));
+  const old = window.__rouletteChromeDgaFeed;
+  try {{ if (old && old.pingTimer) clearInterval(old.pingTimer); }} catch (_) {{}}
+  try {{ if (old && old.ws) old.ws.close(); }} catch (_) {{}}
+
+  const state = window.__rouletteChromeDgaFeed = {{
+    ok: true,
+    mode: 'chrome-runtime-dga',
+    status: 'opening',
+    wsUrl: cfg.wsUrl,
+    casinoId: cfg.casinoId,
+    currency: cfg.currency,
+    ids,
+    sent: 0,
+    frames: 0,
+    errors: 0,
+    openedAt: 0,
+    closedAt: 0,
+    closeCode: 0,
+    closeReason: '',
+    lastError: '',
+    lastMessageAt: 0,
+    buffer: []
+  }};
+
+  function push(kind, data) {{
+    try {{
+      state.buffer.push(JSON.stringify({{__kind:kind, data, t:Date.now()}}));
+      if (state.buffer.length > 1000) state.buffer.splice(0, state.buffer.length - 1000);
+    }} catch (_) {{}}
+  }}
+  function sendSubscribe(ws, asArray) {{
+    for (const tid of ids) {{
+      const keyValue = asArray ? [tid] : tid;
+      ws.send(JSON.stringify({{
+        type: 'subscribe',
+        isDeltaEnabled: true,
+        casinoId: cfg.casinoId,
+        key: keyValue,
+        currency: cfg.currency
+      }}));
+      state.sent += 1;
+    }}
+  }}
+
+  try {{
+    const ws = new WebSocket(cfg.wsUrl);
+    state.ws = ws;
+    ws.onopen = () => {{
+      state.status = 'open';
+      state.openedAt = Date.now();
+      try {{ sendSubscribe(ws, false); }} catch (e) {{ state.lastError=String(e && e.message || e); }}
+      // Some Pragmatic builds/examples use key:[tableId]. Try that too after
+      // the string form, but only once and without closing the feed.
+      setTimeout(() => {{
+        try {{ if (ws.readyState === 1) sendSubscribe(ws, true); }} catch (e) {{}}
+      }}, 4500);
+      push('opened', {{sent: state.sent, casinoId: cfg.casinoId, currency: cfg.currency}});
+    }};
+    ws.onmessage = ev => {{
+      state.frames += 1;
+      state.lastMessageAt = Date.now();
+      if (typeof ev.data === 'string') {{
+        state.buffer.push(ev.data);
+        if (state.buffer.length > 1000) state.buffer.splice(0, state.buffer.length - 1000);
+      }}
+    }};
+    ws.onerror = ev => {{
+      state.errors += 1;
+      state.status = 'error';
+      state.lastError = String((ev && (ev.message || ev.type)) || 'websocket error');
+      push('error', state.lastError);
+    }};
+    ws.onclose = ev => {{
+      state.status = 'closed';
+      state.closedAt = Date.now();
+      state.closeCode = ev && ev.code || 0;
+      state.closeReason = ev && ev.reason || '';
+      push('closed', {{code:state.closeCode, reason:state.closeReason}});
+    }};
+    state.pingTimer = setInterval(() => {{
+      try {{
+        if (ws.readyState === 1) ws.send(JSON.stringify({{type:'ping', pingTime:Date.now()}}));
+      }} catch (_) {{}}
+    }}, 15000);
+  }} catch (e) {{
+    state.status = 'failed';
+    state.lastError = String(e && e.message || e || 'WebSocket failed');
+  }}
+
+  return {{
+    ok: true,
+    mode: 'chrome-runtime-dga',
+    status: state.status,
+    sent: state.sent,
+    tables: ids.length,
+    casinoId: state.casinoId,
+    currency: state.currency,
+    title: document.title || '',
+    url: location.href
+  }};
+}})()
+"""
+
+
+CHROME_DGA_POLL_SCRIPT = r"""
+(() => {
+  const st = window.__rouletteChromeDgaFeed;
+  if (!st) return {ok:false, reason:'Chrome DGA state yok', title:document.title||'', url:location.href};
+  const messages = [];
+  try { messages.push(...st.buffer.splice(0, 120)); } catch (_) {}
+  return {
+    ok: true,
+    mode: 'chrome-runtime-dga',
+    status: st.status || '',
+    readyState: st.ws ? st.ws.readyState : -1,
+    sent: st.sent || 0,
+    tables: (st.ids || []).length,
+    frames: st.frames || 0,
+    errors: st.errors || 0,
+    casinoId: st.casinoId || '',
+    currency: st.currency || '',
+    closeCode: st.closeCode || 0,
+    closeReason: st.closeReason || '',
+    lastError: st.lastError || '',
+    lastMessageAt: st.lastMessageAt || 0,
+    messages,
+    title: document.title || '',
+    url: location.href
+  };
+})()
+"""
+
+
+CHROME_DGA_STOP_SCRIPT = r"""
+(() => {
+  const st = window.__rouletteChromeDgaFeed;
+  if (!st) return {ok:true, stopped:false};
+  try { if (st.pingTimer) clearInterval(st.pingTimer); } catch (_) {}
+  try { if (st.ws) st.ws.close(); } catch (_) {}
+  st.status = 'stopped';
+  return {ok:true, stopped:true};
+})()
+"""
+
+
 class ChromeBridge(threading.Thread):
     TARGET_TYPES = {"page","iframe","worker","shared_worker","service_worker","other","webview"}
 
@@ -7156,6 +7355,13 @@ class ChromeBridge(threading.Thread):
         self.dga_currency = ""
         self.dga_frame_last_keys = {}
         self.dga_feed = DgaLiveFeedCollector(state)
+        self.chrome_dga_enabled = False
+        self.chrome_dga_session = ""
+        self.chrome_dga_context_id = None
+        self.chrome_dga_last_start = 0.0
+        self.chrome_dga_last_poll = 0.0
+        self.chrome_dga_no_data_since = 0.0
+        self.chrome_dga_last_rows_key = ()
         self.manual_api_teach = False
         self.manual_api_teach_started = 0.0
         self.live_result_probe = {}
@@ -7318,27 +7524,228 @@ class ChromeBridge(threading.Thread):
             )
         return True
 
-    def start_dga_live_collection(self, reason="kayıtlı masa canlı feed"):
+    def _dga_table_rows(self):
+        merged = {}
+        with self.collector_lock:
+            for tid, row in (self.collector_seen or {}).items():
+                tid = str(tid or "").strip()
+                if tid:
+                    merged[tid] = dict(row or {})
         with self.state.lock:
-            count = len(getattr(self.state, "table_registry", {}) or {})
-        if not count:
+            for tid, row in (self.state.table_registry or {}).items():
+                tid = str(tid or "").strip()
+                if not tid:
+                    continue
+                old = dict(merged.get(tid, {}) or {})
+                old.update(dict(row or {}))
+                old.setdefault("table_id", tid)
+                merged[tid] = old
+        rows = []
+        for tid, row in merged.items():
+            if str(tid).strip():
+                rows.append({
+                    "table_id": str(tid).strip(),
+                    "display_name": str(row.get("display_name") or tid),
+                })
+        rows.sort(key=lambda row: row["display_name"].lower())
+        return rows
+
+    def start_dga_live_collection(self, reason="kayıtlı masa canlı feed"):
+        rows = self._dga_table_rows()
+        if not rows:
             with self.state.lock:
-                self.state.table_scan_status = "DGA CANLI: kayıtlı masa bankası yok"
+                self.state.table_scan_status = "CHROME DGA: kayıtlı masa bankası yok"
             return False
         self.table_scan_auto_cycle = False
         self.table_scan_next_cycle = 0.0
-        self.dga_feed.configure(
-            casino_id=self.dga_casino_id,
-            currency=self.dga_currency,
-            ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
-            enable=True,
-            reason=reason,
+        self.chrome_dga_enabled = True
+        self.chrome_dga_session = ""
+        self.chrome_dga_context_id = None
+        self.chrome_dga_last_start = 0.0
+        self.chrome_dga_last_poll = 0.0
+        self.chrome_dga_no_data_since = time.time()
+        self.chrome_dga_last_rows_key = tuple(r["table_id"] for r in rows)
+        # V2.9.25: direct Python DGA caused ConnectionResetError on the user's
+        # operator. Stop that path and open the websocket inside Chrome instead.
+        try:
+            self.dga_feed.stop_collection("Chrome Runtime DGA devrede")
+        except Exception:
+            pass
+        ok = self._start_chrome_dga_runtime(rows=rows, reason=reason)
+        if not ok:
+            # Fallback only when Chrome context is not available at all.
+            self.dga_feed.configure(
+                casino_id=self.dga_casino_id,
+                currency=self.dga_currency,
+                ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
+                enable=True,
+                reason=reason,
+            )
+        return ok
+
+    def _start_chrome_dga_runtime(self, rows=None, reason=""):
+        if self.ws is None:
+            with self.state.lock:
+                self.state.table_scan_status = "CHROME DGA: Chrome bağlantısı bekleniyor"
+            return False
+        rows = rows or self._dga_table_rows()
+        if not rows:
+            with self.state.lock:
+                self.state.table_scan_status = "CHROME DGA: kayıtlı masa bankası yok"
+            return False
+        sid, context_id = self._api_refresh_runtime_context()
+        if not sid:
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    "CHROME DGA: uygun Pragmatic/Chrome context yok • "
+                    "bir rulet masası veya lobi açık olsun"
+                )
+            return False
+        now = time.time()
+        self.chrome_dga_session = sid
+        self.chrome_dga_context_id = context_id
+        self.chrome_dga_last_start = now
+        self.chrome_dga_no_data_since = now
+        self.chrome_dga_last_rows_key = tuple(r["table_id"] for r in rows)
+        params = {
+            "expression": build_chrome_dga_start_script(
+                rows,
+                casino_id=self.dga_casino_id,
+                currency=self.dga_currency,
+                ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
+            ),
+            "returnByValue": True,
+            "awaitPromise": True,
+        }
+        if context_id is not None:
+            params["contextId"] = int(context_id)
+        self.send(
+            "Runtime.evaluate",
+            params,
+            session_id=sid,
+            kind="chromedgastart",
+            context={
+                "session": sid,
+                "context_id": context_id,
+                "rows": len(rows),
+                "reason": reason,
+            },
         )
         with self.state.lock:
             self.state.table_scan_status = (
-                f"DGA CANLI: {count} kayıtlı masa için websocket feed başlatıldı"
+                f"CHROME DGA: Chrome içinde websocket açılıyor • {len(rows)} masa"
             )
         return True
+
+    def _poll_chrome_dga_runtime(self):
+        if not self.chrome_dga_enabled or self.ws is None:
+            return False
+        now = time.time()
+        rows = self._dga_table_rows()
+        rows_key = tuple(r["table_id"] for r in rows)
+        if (
+            not self.chrome_dga_session
+            or rows_key != tuple(self.chrome_dga_last_rows_key or ())
+            or now - float(self.chrome_dga_last_start or 0.0) >= TABLE_SCAN_AUTO_REFRESH_SECONDS
+        ):
+            if now - float(self.chrome_dga_last_start or 0.0) >= 3.0:
+                return self._start_chrome_dga_runtime(rows=rows, reason="yeniden başlat")
+            return False
+        if now - float(self.chrome_dga_last_poll or 0.0) < 2.0:
+            return False
+        self.chrome_dga_last_poll = now
+        params = {
+            "expression": CHROME_DGA_POLL_SCRIPT,
+            "returnByValue": True,
+            "awaitPromise": True,
+        }
+        if self.chrome_dga_context_id is not None:
+            params["contextId"] = int(self.chrome_dga_context_id)
+        self.send(
+            "Runtime.evaluate",
+            params,
+            session_id=self.chrome_dga_session,
+            kind="chromedgapoll",
+            context={
+                "session": self.chrome_dga_session,
+                "context_id": self.chrome_dga_context_id,
+            },
+        )
+        return True
+
+    def _handle_chrome_dga_runtime(self, obj, context=None, started=False):
+        try:
+            value = obj.get("result", {}).get("result", {}).get("value")
+            if not isinstance(value, dict):
+                return
+            now = time.time()
+            casino_id = str(value.get("casinoId") or "").strip()
+            currency = str(value.get("currency") or "").strip().upper()
+            if casino_id or currency:
+                self._record_dga_config(
+                    casino_id=casino_id,
+                    currency=currency,
+                    ws_url=self.dga_ws_url,
+                    source="Chrome Runtime DGA",
+                )
+
+            messages = value.get("messages") or []
+            handled = 0
+            for raw in messages if isinstance(messages, list) else []:
+                if self._handle_dga_ws_payload(raw, source_label="Chrome Runtime DGA"):
+                    handled += 1
+            status = str(value.get("status") or "")
+            ready = value.get("readyState", "")
+            frames = int(value.get("frames", 0) or 0)
+            sent = int(value.get("sent", 0) or 0)
+            tables = int(value.get("tables", 0) or 0)
+            err = str(value.get("lastError") or value.get("closeReason") or "")
+            close_code = int(value.get("closeCode", 0) or 0)
+
+            if messages:
+                self.chrome_dga_no_data_since = now
+            elif frames <= 0 and not self.chrome_dga_no_data_since:
+                self.chrome_dga_no_data_since = now
+
+            # If Chrome websocket closed/errors without useful data, reinject
+            # periodically instead of falling back to the reset-prone Python path.
+            if status in ("closed", "error", "failed") and now - float(self.chrome_dga_last_start or 0.0) >= 5.0:
+                self.chrome_dga_session = ""
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"CHROME DGA: {status}"
+                        + (f" {close_code}" if close_code else "")
+                        + (f" • {err[:60]}" if err else "")
+                        + " • yeniden deneniyor"
+                    )
+                return
+
+            if handled:
+                # _handle_dga_ws_payload already wrote a data-specific status.
+                return
+
+            if started:
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"CHROME DGA: başlatıldı • {tables} masa • "
+                        f"casino {casino_id or self.dga_casino_id or '?'} • "
+                        f"{currency or self.dga_currency or '?'}"
+                    )
+            else:
+                wait_sec = int(now - float(self.chrome_dga_no_data_since or now))
+                extra = ""
+                if status in ("closed", "error", "failed"):
+                    extra = (f" • {err[:70]}" if err else "")
+                elif frames > 0:
+                    extra = " • frame var, tablo verisi bekleniyor"
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"CHROME DGA: {status or 'bekleniyor'} • "
+                        f"{sent}/{tables} abonelik • {frames} frame • "
+                        f"{wait_sec}s veri bekliyor{extra}"
+                    )
+        except Exception:
+            pass
 
     def _record_dga_config(self, casino_id="", currency="", ws_url="", source=""):
         changed = False
@@ -7362,6 +7769,9 @@ class ChromeBridge(threading.Thread):
                 )
             # If the user already started DGA collection with the fallback id,
             # update the running worker to the real operator parameters.
+            if self.chrome_dga_enabled:
+                self.chrome_dga_session = ""
+                self.chrome_dga_last_start = 0.0
             if getattr(self.dga_feed, "enabled", False):
                 self.dga_feed.configure(
                     casino_id=self.dga_casino_id,
@@ -7372,7 +7782,7 @@ class ChromeBridge(threading.Thread):
                 )
         return changed
 
-    def _handle_dga_ws_payload(self, payload_text, sid="", direction=""):
+    def _handle_dga_ws_payload(self, payload_text, sid="", direction="", source_label="Chrome DGA WebSocket"):
         raw = str(payload_text or "")
         if not raw:
             return False
@@ -7421,7 +7831,7 @@ class ChromeBridge(threading.Thread):
                         nums,
                         table_id=tid,
                         display_name=name,
-                        source_label="Chrome DGA WebSocket",
+                        source_label=source_label,
                     )
                     self.state.mark_table_attempt(tid, ok=True)
                     with self.state.lock:
@@ -7547,6 +7957,18 @@ class ChromeBridge(threading.Thread):
         if manual_stop:
             self.table_scan_auto_cycle = False
             self.table_scan_next_cycle = 0.0
+            self.chrome_dga_enabled = False
+            if self.ws is not None and self.chrome_dga_session:
+                try:
+                    self.send(
+                        "Runtime.evaluate",
+                        {"expression": CHROME_DGA_STOP_SCRIPT, "returnByValue": True},
+                        session_id=self.chrome_dga_session,
+                        kind="chromedgastop",
+                        context={},
+                    )
+                except Exception:
+                    pass
             try:
                 self.dga_feed.stop_collection("kullanıcı durdurdu")
             except Exception:
@@ -8854,6 +9276,7 @@ class ChromeBridge(threading.Thread):
 
                 self._select_active_table()
                 self._collector_tick()
+                self._poll_chrome_dga_runtime()
                 self._pump_table_scan_probes()
             except Exception:
                 pass
@@ -9049,6 +9472,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_enabled = False
         self.table_scan_auto_cycle = False
         self.table_scan_next_cycle = 0.0
+        self.chrome_dga_enabled = False
         try:
             self.dga_feed.stop_collection("API öğren modu")
         except Exception:
@@ -9628,6 +10052,15 @@ class ChromeBridge(threading.Thread):
 
             elif kind == "directhistory":
                 self.handle_direct_runtime(obj, context)
+
+            elif kind == "chromedgastart":
+                self._handle_chrome_dga_runtime(obj, context, started=True)
+
+            elif kind == "chromedgapoll":
+                self._handle_chrome_dga_runtime(obj, context, started=False)
+
+            elif kind == "chromedgastop":
+                pass
 
             elif kind == "apirefreshruntime":
                 meta = context if isinstance(context, dict) else {}
@@ -10226,7 +10659,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.24 • DGA Live Feed")
+        self.root.title("Roulette Pro AI V2.9.25 • Chrome DGA Feed")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -10397,7 +10830,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.24 DGA LIVE",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.25 CHROME DGA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
