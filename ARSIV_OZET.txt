@@ -1,0 +1,26 @@
+V2.1 ARŞİV ÖZETİ
+
+4 dosya işlendi ve tekrarlar temizlendi.
+
+Mega Roulette arşivi: 92 spin
+Roulette/Auto arşivi: 79 spin
+Toplam ayrı masa gözlemi: 171 spin
+
+NOT:
+- roulette_learning(1).json içindeki 50 spin, yeni roulette_learning_roulette.json içindeki ilk 50 spinin aynısıydı; tekrar eklenmedi.
+- İki Roulette prediction logundaki toplam 68 gerçek sonuç, 79 spinlik güncel öğrenme dizisinin kuyruğuyla birebir eşleşti; tekrar eklenmedi.
+- Mega sonuçları ayrı tutuldu; Roulette/Auto ile karıştırılmadı.
+
+Güncel Roulette doğrulaması:
+Tam sayı: 2/68
+Top-5: 7/68
+Komşu: 9/68
+Bölge: 21/68
+
+Uzman Top-5 isabetleri:
+RECENCY: 4/68
+WHEEL: 9/68
+TRANSITION: 11/68
+WEB: 2/16
+
+V2.1 başlangıç ağırlığı bu gerçek kayda göre Recency'den biraz alınıp Transition'a verildi.

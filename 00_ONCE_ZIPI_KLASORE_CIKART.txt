@@ -1,0 +1,9 @@
+ÖNEMLİ: PROGRAMI ZIP/RAR İÇİNDEN ÇALIŞTIRMAYIN
+
+1. ZIP dosyasına sağ tıklayın.
+2. "Tümünü ayıkla" veya "Klasöre çıkart" seçeneğini kullanın.
+3. Çıkartılan V2_9_12_MULTI_TABLE_COLLECTOR klasörünü açın.
+4. BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat dosyasına çift tıklayın.
+
+WinRAR içinden doğrudan çift tıklanırsa yalnız BAT dosyası geçici klasöre
+çıkar ve roulette_v1.py bulunamadığı için program başlayamaz.
