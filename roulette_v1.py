@@ -30,14 +30,14 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.17: single collector-tab click pipeline.
+# V2.9.18: single collector-tab click pipeline with data wait.
 # Extra tab opening is disabled because some sites redirect those tabs to the
 # operator home page. The background collector tab clicks visible lobby cards
-# one by one, waits for Pragmatic network/tableId, then returns to the lobby.
+# one by one, waits for statisticHistory/SON500 data or timeout, then returns.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
-COLLECTOR_CARD_CLICK_SECONDS = 24.0
+COLLECTOR_CARD_CLICK_SECONDS = 10.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -7495,7 +7495,7 @@ class ChromeBridge(threading.Thread):
                 self.state.table_scan_status = (
                     "MASA TARAMA: masa kartı açıldı • "
                     + (clicked_label[:60] if clicked_label else "veri bekleniyor")
-                    + " • tableId yakalanınca lobiye dönülecek"
+                    + " • veri/SON500 bekleniyor"
                 )
             return
 
@@ -7799,7 +7799,11 @@ class ChromeBridge(threading.Thread):
 
         if self._is_collector_session(sid):
             self.table_scan_found_ids.add(table_id)
-            self.table_scan_click_deadlines[sid] = now + 2.5
+            self.table_scan_click_deadlines[sid] = now + 8.0
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    f"MASA TARAMA: tableId yakalandı • {table_id} • veri çekiliyor"
+                )
             probe_tid = self._target_id_for_session(sid)
             if probe_tid in self.table_scan_probe_targets:
                 self.table_scan_probe_targets[probe_tid]["table_id_seen"] = table_id
@@ -8115,6 +8119,29 @@ class ChromeBridge(threading.Thread):
                         # Preserve order while removing duplicate context ids.
                         scan_contexts = list(dict.fromkeys(scan_contexts))
                         for context_id in scan_contexts:
+                            direct_key = (sid, context_id, "collector_direct")
+                            if now - float(last_direct_scan.get(direct_key, 0.0)) >= 2.0:
+                                last_direct_scan[direct_key] = now
+                                direct_params = {
+                                    "expression": DIRECT_HISTORY_SCAN,
+                                    "returnByValue": True,
+                                    "awaitPromise": True,
+                                }
+                                if context_id is not None:
+                                    direct_params["contextId"] = int(context_id)
+                                self.send(
+                                    "Runtime.evaluate",
+                                    direct_params,
+                                    session_id=sid,
+                                    kind="directhistory",
+                                    context={
+                                        "session": sid,
+                                        "context_id": context_id,
+                                        "origin": "collector",
+                                        "name": "collector",
+                                    },
+                                )
+
                             scan_key = (sid, context_id)
                             if now - float(last_table_nav_scan.get(scan_key, 0.0)) < 2.0:
                                 continue
@@ -8289,7 +8316,25 @@ class ChromeBridge(threading.Thread):
                     source_label="MULTI TABLE statisticHistory",
                 )
                 self.state.mark_table_attempt(tid, ok=True)
+                if self.table_scan_enabled and tid in self.table_scan_found_ids:
+                    now_done = time.time()
+                    for scan_sid in list(self.table_scan_click_deadlines.keys()):
+                        self.table_scan_click_deadlines[scan_sid] = min(
+                            float(self.table_scan_click_deadlines.get(scan_sid, now_done + 1.0) or 0.0),
+                            now_done + 1.0,
+                        )
+                    with self.state.lock:
+                        self.state.table_scan_status = (
+                            f"MASA TARAMA: veri alındı • {tid} • sıradaki masaya geçiliyor"
+                        )
             except Exception as exc:
+                if self.table_scan_enabled and tid in self.table_scan_found_ids:
+                    now_fail = time.time()
+                    for scan_sid in list(self.table_scan_click_deadlines.keys()):
+                        self.table_scan_click_deadlines[scan_sid] = min(
+                            float(self.table_scan_click_deadlines.get(scan_sid, now_fail + 2.0) or 0.0),
+                            now_fail + 2.0,
+                        )
                 self.state.mark_table_attempt(
                     tid,
                     error=f"{type(exc).__name__}: {exc}",
@@ -8459,6 +8504,32 @@ class ChromeBridge(threading.Thread):
             theme_code=str(value.get("themeCode") or "")
             title=str(value.get("title") or "")
             sid_ctx = str(ctx_meta.get("session","") or "")
+
+            if sid_ctx and self._is_collector_session(sid_ctx):
+                if table_id:
+                    self.table_scan_found_ids.add(table_id)
+                if value.get("ok") and value.get("body") and table_id:
+                    nums = extract_statistic_history(value.get("body"))
+                    if len(nums) >= 20:
+                        self.state.store_background_table_history(
+                            nums,
+                            table_id=table_id,
+                            display_name=title or self.table_scan_last_clicked_label,
+                            source_label="CLICK SCAN statisticHistory",
+                        )
+                        self.state.mark_table_attempt(table_id, ok=True)
+                        self.table_scan_click_deadlines[sid_ctx] = time.time() + 0.8
+                        with self.state.lock:
+                            self.state.table_scan_status = (
+                                f"MASA TARAMA: veri alındı • {table_id} • sıradaki masaya geçiliyor"
+                            )
+                    elif table_id:
+                        # tableId arrived but schema was not usable; do not wait long.
+                        self.table_scan_click_deadlines[sid_ctx] = min(
+                            float(self.table_scan_click_deadlines.get(sid_ctx, time.time() + 2.0) or 0.0),
+                            time.time() + 2.0,
+                        )
+                return
 
             if table_id:
                 if self.active_table_id and table_id != self.active_table_id:
@@ -9171,7 +9242,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.17 • Single Tab Click Scan")
+        self.root.title("Roulette Pro AI V2.9.18 • Data Wait Click Scan")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9342,7 +9413,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.17 CLICK SCAN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.18 DATA SCAN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

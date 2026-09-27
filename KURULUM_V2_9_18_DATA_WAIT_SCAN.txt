@@ -1,0 +1,24 @@
+ROULETTE PRO AI V2.9.18 DATA SCAN KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Önceden kalmış gereksiz ana sayfa / Pragmatic sekmeleri varsa kapat.
+5. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.18 DATA SCAN yazmalı.
+- MASA TARAMA sırasında şunları görmelisin:
+  * masa kartı açıldı • veri/SON500 bekleniyor
+  * tableId yakalandı • veri çekiliyor
+  * veri alındı • sıradaki masaya geçiliyor
+
+DAVRANIŞ
+- Kart tıklanır, veri alınırsa hızlı geçilir.
+- Veri gelmezse kısa zaman aşımıyla o masa geçilir.
+- Ekstra yeni sekme açılmaz; collector/lobi sekmesi içinde tek tek tıklar.
+
+NOT
+- BAT dosyasının adında V2_9_12 yazması normaldir.
