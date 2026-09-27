@@ -31,10 +31,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.25: Chrome Runtime DGA feed.
-# If direct Python WebSocket is reset by the operator/network, DGA is opened
-# inside Chrome's active Pragmatic page context. This preserves browser origin
-# and avoids the old API/lobby-click dead ends.
+# V2.9.26: multi-context Chrome Runtime DGA feed.
+# If a single Chrome context reports 0/0 subscriptions, the collector now
+# injects/polls several Pragmatic/page contexts and automatically reinjects
+# instead of waiting forever.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -7358,6 +7358,8 @@ class ChromeBridge(threading.Thread):
         self.chrome_dga_enabled = False
         self.chrome_dga_session = ""
         self.chrome_dga_context_id = None
+        self.chrome_dga_contexts = []
+        self.chrome_dga_context_states = {}
         self.chrome_dga_last_start = 0.0
         self.chrome_dga_last_poll = 0.0
         self.chrome_dga_no_data_since = 0.0
@@ -7583,6 +7585,76 @@ class ChromeBridge(threading.Thread):
             )
         return ok
 
+    def _chrome_dga_runtime_contexts(self, limit=10):
+        """Return several Chrome execution contexts to try for DGA WebSocket.
+
+        V2.9.25 used one context; on the user's machine polling returned 0/0
+        because that context did not keep the injected window state. V2.9.26
+        starts/polls multiple Pragmatic/page contexts and uses whichever returns
+        feed data first.
+        """
+        candidates = []
+        sids = []
+        if self.active_game_sid:
+            sids.append(self.active_game_sid)
+        for sid in self.session_info.keys():
+            if sid not in sids:
+                sids.append(sid)
+        for sid in sids:
+            if self._is_collector_session(sid):
+                continue
+            if not self.is_direct_probe_target(sid):
+                continue
+            info = self.session_info.get(sid, {}) or {}
+            url = str(info.get("url", "") or "").lower()
+            title = str(info.get("title", "") or "").lower()
+            text = url + " " + title
+            if any(x in text for x in (
+                "livechat", "gamedata365", "youtube", "facebook", "google",
+            )):
+                continue
+            base = 0
+            if sid == self.active_game_sid:
+                base += 1000
+            if "games." in url or "pragmatic" in text:
+                base += 400
+            if "roulette" in text or "rulet" in text:
+                base += 120
+            if "live-casino" in url or "livecasino" in url:
+                base += 60
+            # Try the session default context too; for top pages this is often
+            # where WebSocket is allowed and where window state survives.
+            candidates.append((base + 10, sid, None))
+            for ctx in (self.execution_contexts.get(sid) or {}).values():
+                cid = ctx.get("id")
+                if cid is None:
+                    continue
+                aux = ctx.get("auxData") or {}
+                origin = str(ctx.get("origin") or "").lower()
+                name = str(ctx.get("name") or "").lower()
+                score = base
+                if bool(aux.get("isDefault", False)):
+                    score += 60
+                if "games." in origin or "pragmatic" in origin:
+                    score += 500
+                if origin.startswith(("http://", "https://")):
+                    score += 20
+                if "isolated" in name:
+                    score -= 80
+                candidates.append((score, sid, int(cid)))
+        candidates.sort(key=lambda row: -row[0])
+        out = []
+        seen = set()
+        for _score, sid, cid in candidates:
+            key = (sid, cid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"session": sid, "context_id": cid})
+            if len(out) >= max(1, int(limit or 10)):
+                break
+        return out
+
     def _start_chrome_dga_runtime(self, rows=None, reason=""):
         if self.ws is None:
             with self.state.lock:
@@ -7593,8 +7665,8 @@ class ChromeBridge(threading.Thread):
             with self.state.lock:
                 self.state.table_scan_status = "CHROME DGA: kayıtlı masa bankası yok"
             return False
-        sid, context_id = self._api_refresh_runtime_context()
-        if not sid:
+        contexts = self._chrome_dga_runtime_contexts(limit=10)
+        if not contexts:
             with self.state.lock:
                 self.state.table_scan_status = (
                     "CHROME DGA: uygun Pragmatic/Chrome context yok • "
@@ -7602,40 +7674,51 @@ class ChromeBridge(threading.Thread):
                 )
             return False
         now = time.time()
-        self.chrome_dga_session = sid
-        self.chrome_dga_context_id = context_id
+        self.chrome_dga_contexts = list(contexts)
+        self.chrome_dga_context_states = {}
+        self.chrome_dga_session = str(contexts[0].get("session") or "")
+        self.chrome_dga_context_id = contexts[0].get("context_id")
         self.chrome_dga_last_start = now
         self.chrome_dga_no_data_since = now
         self.chrome_dga_last_rows_key = tuple(r["table_id"] for r in rows)
-        params = {
-            "expression": build_chrome_dga_start_script(
-                rows,
-                casino_id=self.dga_casino_id,
-                currency=self.dga_currency,
-                ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
-            ),
-            "returnByValue": True,
-            "awaitPromise": True,
-        }
-        if context_id is not None:
-            params["contextId"] = int(context_id)
-        self.send(
-            "Runtime.evaluate",
-            params,
-            session_id=sid,
-            kind="chromedgastart",
-            context={
-                "session": sid,
-                "context_id": context_id,
-                "rows": len(rows),
-                "reason": reason,
-            },
+        expr = build_chrome_dga_start_script(
+            rows,
+            casino_id=self.dga_casino_id,
+            currency=self.dga_currency,
+            ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
         )
+        sent_contexts = 0
+        for ctx in contexts:
+            sid = str(ctx.get("session") or "")
+            context_id = ctx.get("context_id")
+            if not sid:
+                continue
+            params = {
+                "expression": expr,
+                "returnByValue": True,
+                "awaitPromise": True,
+            }
+            if context_id is not None:
+                params["contextId"] = int(context_id)
+            self.send(
+                "Runtime.evaluate",
+                params,
+                session_id=sid,
+                kind="chromedgastart",
+                context={
+                    "session": sid,
+                    "context_id": context_id,
+                    "rows": len(rows),
+                    "reason": reason,
+                },
+            )
+            sent_contexts += 1
         with self.state.lock:
             self.state.table_scan_status = (
-                f"CHROME DGA: Chrome içinde websocket açılıyor • {len(rows)} masa"
+                f"CHROME DGA: Chrome içinde websocket açılıyor • {len(rows)} masa • "
+                f"{sent_contexts} context"
             )
-        return True
+        return sent_contexts > 0
 
     def _poll_chrome_dga_runtime(self):
         if not self.chrome_dga_enabled or self.ws is None:
@@ -7643,40 +7726,72 @@ class ChromeBridge(threading.Thread):
         now = time.time()
         rows = self._dga_table_rows()
         rows_key = tuple(r["table_id"] for r in rows)
-        if (
-            not self.chrome_dga_session
+        should_restart = (
+            not self.chrome_dga_contexts
             or rows_key != tuple(self.chrome_dga_last_rows_key or ())
             or now - float(self.chrome_dga_last_start or 0.0) >= TABLE_SCAN_AUTO_REFRESH_SECONDS
-        ):
+        )
+        # If every polled context says 0 tables/no state for a while, the page
+        # probably navigated or the previous injection ran in the wrong frame.
+        if not should_restart and now - float(self.chrome_dga_last_start or 0.0) >= 10.0:
+            states = [
+                st for st in (self.chrome_dga_context_states or {}).values()
+                if now - float(st.get("last", 0.0) or 0.0) <= 8.0
+            ]
+            if states and not any(int(st.get("tables", 0) or 0) > 0 for st in states):
+                should_restart = True
+            if (
+                now - float(self.chrome_dga_no_data_since or now) >= 45.0
+                and states
+                and not any(int(st.get("frames", 0) or 0) > 0 for st in states)
+            ):
+                should_restart = True
+        if should_restart:
             if now - float(self.chrome_dga_last_start or 0.0) >= 3.0:
-                return self._start_chrome_dga_runtime(rows=rows, reason="yeniden başlat")
+                return self._start_chrome_dga_runtime(rows=rows, reason="context yenile")
             return False
         if now - float(self.chrome_dga_last_poll or 0.0) < 2.0:
             return False
         self.chrome_dga_last_poll = now
-        params = {
-            "expression": CHROME_DGA_POLL_SCRIPT,
-            "returnByValue": True,
-            "awaitPromise": True,
-        }
-        if self.chrome_dga_context_id is not None:
-            params["contextId"] = int(self.chrome_dga_context_id)
-        self.send(
-            "Runtime.evaluate",
-            params,
-            session_id=self.chrome_dga_session,
-            kind="chromedgapoll",
-            context={
-                "session": self.chrome_dga_session,
-                "context_id": self.chrome_dga_context_id,
-            },
-        )
-        return True
+        sent = 0
+        for ctx in list(self.chrome_dga_contexts or []):
+            sid = str(ctx.get("session") or "")
+            context_id = ctx.get("context_id")
+            if not sid:
+                continue
+            params = {
+                "expression": CHROME_DGA_POLL_SCRIPT,
+                "returnByValue": True,
+                "awaitPromise": True,
+            }
+            if context_id is not None:
+                params["contextId"] = int(context_id)
+            self.send(
+                "Runtime.evaluate",
+                params,
+                session_id=sid,
+                kind="chromedgapoll",
+                context={"session": sid, "context_id": context_id},
+            )
+            sent += 1
+        return sent > 0
 
     def _handle_chrome_dga_runtime(self, obj, context=None, started=False):
         try:
             value = obj.get("result", {}).get("result", {}).get("value")
+            meta = context if isinstance(context, dict) else {}
+            sid_key = str(meta.get("session") or "")
+            ctx_id = meta.get("context_id")
+            ctx_key = f"{sid_key}:{ctx_id if ctx_id is not None else 'default'}"
             if not isinstance(value, dict):
+                self.chrome_dga_context_states[ctx_key] = {
+                    "ok": False,
+                    "tables": 0,
+                    "sent": 0,
+                    "frames": 0,
+                    "status": "cevap yok",
+                    "last": time.time(),
+                }
                 return
             now = time.time()
             casino_id = str(value.get("casinoId") or "").strip()
@@ -7694,55 +7809,107 @@ class ChromeBridge(threading.Thread):
             for raw in messages if isinstance(messages, list) else []:
                 if self._handle_dga_ws_payload(raw, source_label="Chrome Runtime DGA"):
                     handled += 1
+            ok_value = bool(value.get("ok", True))
             status = str(value.get("status") or "")
-            ready = value.get("readyState", "")
             frames = int(value.get("frames", 0) or 0)
             sent = int(value.get("sent", 0) or 0)
             tables = int(value.get("tables", 0) or 0)
-            err = str(value.get("lastError") or value.get("closeReason") or "")
+            err = str(value.get("lastError") or value.get("reason") or value.get("closeReason") or "")
             close_code = int(value.get("closeCode", 0) or 0)
 
-            if messages:
+            self.chrome_dga_context_states[ctx_key] = {
+                "ok": ok_value,
+                "tables": tables,
+                "sent": sent,
+                "frames": frames,
+                "status": status,
+                "error": err,
+                "last": now,
+            }
+
+            if messages or frames > 0 or handled:
                 self.chrome_dga_no_data_since = now
             elif frames <= 0 and not self.chrome_dga_no_data_since:
                 self.chrome_dga_no_data_since = now
-
-            # If Chrome websocket closed/errors without useful data, reinject
-            # periodically instead of falling back to the reset-prone Python path.
-            if status in ("closed", "error", "failed") and now - float(self.chrome_dga_last_start or 0.0) >= 5.0:
-                self.chrome_dga_session = ""
-                with self.state.lock:
-                    self.state.table_scan_status = (
-                        f"CHROME DGA: {status}"
-                        + (f" {close_code}" if close_code else "")
-                        + (f" • {err[:60]}" if err else "")
-                        + " • yeniden deneniyor"
-                    )
-                return
 
             if handled:
                 # _handle_dga_ws_payload already wrote a data-specific status.
                 return
 
+            recent_states = [
+                st for st in (self.chrome_dga_context_states or {}).values()
+                if now - float(st.get("last", 0.0) or 0.0) <= 8.0
+            ]
+            valid = [st for st in recent_states if int(st.get("tables", 0) or 0) > 0]
+            total_frames = sum(int(st.get("frames", 0) or 0) for st in valid)
+            max_tables = max([int(st.get("tables", 0) or 0) for st in valid] or [0])
+            max_sent = max([int(st.get("sent", 0) or 0) for st in valid] or [0])
+            context_count = len(self.chrome_dga_contexts or [])
+
+            # Do not leave the user stuck at 0/0. That means the injected state
+            # was not found in the polled context; force a reinjection cycle.
+            if (
+                not valid
+                and not started
+                and now - float(self.chrome_dga_last_start or 0.0) >= 10.0
+            ):
+                self.chrome_dga_contexts = []
+                self.chrome_dga_session = ""
+                self.chrome_dga_last_start = 0.0
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"CHROME DGA: context state boş • {context_count} context • "
+                        "yeniden başlatılıyor"
+                    )
+                return
+
+            if (
+                valid
+                and total_frames <= 0
+                and now - float(self.chrome_dga_no_data_since or now) >= 45.0
+            ):
+                self.chrome_dga_contexts = []
+                self.chrome_dga_session = ""
+                self.chrome_dga_last_start = 0.0
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        "CHROME DGA: 45 sn frame yok • context yenileniyor"
+                    )
+                return
+
+            if status in ("closed", "error", "failed") and now - float(self.chrome_dga_last_start or 0.0) >= 5.0:
+                if not any(str(st.get("status") or "") == "open" for st in valid):
+                    self.chrome_dga_contexts = []
+                    self.chrome_dga_session = ""
+                    self.chrome_dga_last_start = 0.0
+                    with self.state.lock:
+                        self.state.table_scan_status = (
+                            f"CHROME DGA: {status}"
+                            + (f" {close_code}" if close_code else "")
+                            + (f" • {err[:60]}" if err else "")
+                            + " • yeniden deneniyor"
+                        )
+                    return
+
             if started:
                 with self.state.lock:
                     self.state.table_scan_status = (
-                        f"CHROME DGA: başlatıldı • {tables} masa • "
-                        f"casino {casino_id or self.dga_casino_id or '?'} • "
+                        f"CHROME DGA: başlatıldı • {tables or meta.get('rows', 0)} masa • "
+                        f"{context_count} context • casino {casino_id or self.dga_casino_id or '?'} • "
                         f"{currency or self.dga_currency or '?'}"
                     )
             else:
                 wait_sec = int(now - float(self.chrome_dga_no_data_since or now))
                 extra = ""
-                if status in ("closed", "error", "failed"):
-                    extra = (f" • {err[:70]}" if err else "")
-                elif frames > 0:
+                if not ok_value:
+                    extra = (f" • {err[:70]}" if err else " • state yok")
+                elif total_frames > 0:
                     extra = " • frame var, tablo verisi bekleniyor"
                 with self.state.lock:
                     self.state.table_scan_status = (
                         f"CHROME DGA: {status or 'bekleniyor'} • "
-                        f"{sent}/{tables} abonelik • {frames} frame • "
-                        f"{wait_sec}s veri bekliyor{extra}"
+                        f"{max_sent}/{max_tables} abonelik • {total_frames} frame • "
+                        f"{context_count} context • {wait_sec}s veri bekliyor{extra}"
                     )
         except Exception:
             pass
@@ -7771,6 +7938,8 @@ class ChromeBridge(threading.Thread):
             # update the running worker to the real operator parameters.
             if self.chrome_dga_enabled:
                 self.chrome_dga_session = ""
+                self.chrome_dga_contexts = []
+                self.chrome_dga_context_states = {}
                 self.chrome_dga_last_start = 0.0
             if getattr(self.dga_feed, "enabled", False):
                 self.dga_feed.configure(
@@ -10659,7 +10828,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.25 • Chrome DGA Feed")
+        self.root.title("Roulette Pro AI V2.9.26 • Multi Chrome DGA")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -10830,7 +10999,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.25 CHROME DGA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.26 MULTI DGA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
