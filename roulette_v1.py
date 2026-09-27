@@ -30,6 +30,8 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
+COLLECTOR_PROBE_MAX_CONCURRENT = 2
+COLLECTOR_PROBE_SECONDS = 28.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -6382,7 +6384,12 @@ def build_multi_table_nav_scan():
   }}).find(Boolean);
 
   const scanState=window.__rouletteLobbyScanState
-    || (window.__rouletteLobbyScanState={{menuAttemptAt:0,categoryAttemptAt:0}});
+    || (window.__rouletteLobbyScanState={{
+      menuAttemptAt:0,
+      categoryAttemptAt:0,
+      categoryAttempts:0,
+      categoryFirstSeenAt:0
+    }});
   const selected=el => {{
     if (!el) return false;
     const cls=String(el.className && el.className.baseVal || el.className || '');
@@ -6393,17 +6400,29 @@ def build_multi_table_nav_scan():
       || /(^|[\s_-])(active|selected|current|checked)([\s_-]|$)/i.test(cls);
   }};
 
+  let categoryState = 'missing';
   if (category) {{
-    if (!selected(category)) {{
-      if (Date.now()-scanState.categoryAttemptAt>=3500) {{
+    if (selected(category)) {{
+      categoryState = 'selected';
+    }} else {{
+      categoryState = 'unconfirmed';
+      if (!scanState.categoryFirstSeenAt) scanState.categoryFirstSeenAt = Date.now();
+      if (Date.now()-scanState.categoryAttemptAt>=3500 && (scanState.categoryAttempts||0) < 4) {{
         try {{
           category.click();
           scanState.categoryAttemptAt=Date.now();
+          scanState.categoryAttempts=(scanState.categoryAttempts||0)+1;
         }} catch (e) {{
           return {{ok:false,mode:'waiting',stage:'roulette-click-failed',reason:String(e)}};
         }}
+        return {{
+          ok:true,mode:'navigating',stage:'roulette-selecting',
+          attempts:scanState.categoryAttempts,title,url:href
+        }};
       }}
-      return {{ok:true,mode:'navigating',stage:'roulette-selecting',title,url:href}};
+      // Some Pragmatic lobby builds never mark the category as selected.
+      // After a few clicks, continue with visible roulette cards instead of
+      // getting stuck forever in "roulette-selecting".
     }}
   }} else if (Date.now()-scanState.menuAttemptAt>=5000) {{
     const menuWords=/MENU|CATEGORY|CATEGORIES|SIDEBAR|DRAWER|EXPAND|COLLAPSE|NAVIGATION|ARROW|CHEVRON/;
@@ -6435,38 +6454,92 @@ def build_multi_table_nav_scan():
 
   const cards=[];
   const seen=new Set();
-  for (const el of document.querySelectorAll('div,span,a,button')) {{
-    if (!visible(el)) continue;
-    const text=norm(el.innerText || el.textContent);
-    if (!text || text.length>180 || !/(ROULETTE|RULET)/.test(text)) continue;
-    if (/TOURNAMENT|HISTORY|SON 500|LAST 500|BLACKJACK|BACCARAT|POKER/.test(text)) continue;
-    if (categoryLabels.has(text)) continue;
-    const tile=el.closest && el.closest(
-      '[data-testid="wow-tile"],[data-testid*="tile" i],[class*="tile" i]'
-    );
-    const hit=tile || clickable(el);
-    if (!hit || !visible(hit) || seen.has(hit)) continue;
-    const label=norm(hit.innerText || hit.textContent);
-    if (!/(ROULETTE|RULET)/.test(label) || label.length>260) continue;
-    seen.add(hit);
-    const href=String(hit.href || hit.getAttribute('href') || '');
-    const testid=String(hit.getAttribute('data-testid') || '');
-    const attrs=Array.from(hit.attributes || []);
-    let tableId=String(
-      hit.getAttribute('data-table-id') || hit.getAttribute('data-tableid') || ''
-    );
-    if (!tableId) {{
-      const idAttr=attrs.find(a => /^(data-)?table[_-]?id$/i.test(a.name));
-      if (idAttr) tableId=String(idAttr.value || '');
-    }}
-    if (!tableId && href) {{
+  const badCardText=/TOURNAMENT|HISTORY|SON 500|LAST 500|BLACKJACK|BACCARAT|POKER|AUTO PLAY|OTOMATIK OYUN|BAHIS|BET|CHIP|ÇIP/;
+  function attrAny(el,names) {{
+    for (const n of names) {{
       try {{
-        const u=new URL(href,location.href);
-        tableId=u.searchParams.get('tableId') || u.searchParams.get('table_id') || '';
+        const v=el.getAttribute(n);
+        if (v) return String(v).trim();
       }} catch (_) {{}}
     }}
-    const key=(label+'|'+href+'|'+testid).slice(0,420);
-    cards.push({{key,label,href,testid,table_id:tableId}});
+    return '';
+  }}
+  function firstAttrInTree(el,names) {{
+    let p=el;
+    for(let i=0;i<6 && p;i++,p=p.parentElement) {{
+      const v=attrAny(p,names);
+      if (v) return v;
+    }}
+    return '';
+  }}
+  function hrefOf(el) {{
+    let p=el;
+    for(let i=0;i<6 && p;i++,p=p.parentElement) {{
+      const h=String(p.href || p.getAttribute && (
+        p.getAttribute('href') || p.getAttribute('data-href') ||
+        p.getAttribute('data-url') || p.getAttribute('data-launch-url') ||
+        p.getAttribute('data-game-url') || ''
+      ) || '').trim();
+      if (h) {{
+        try {{ return new URL(h, location.href).toString(); }} catch (_) {{ return h; }}
+      }}
+    }}
+    return '';
+  }}
+
+  const tileSelector=[
+    '[data-gameid]','[data-game-id]','[data-table-id]','[data-tableid]',
+    '[data-testid="wow-tile"]','[data-testid*="tile" i]',
+    '[data-testid*="game" i]','[data-testid*="table" i]',
+    '[class*="tile" i]','[class*="card" i]','[class*="game" i]'
+  ].join(',');
+  const candidates=Array.from(document.querySelectorAll(tileSelector));
+  if (!candidates.length) candidates.push(...Array.from(document.querySelectorAll('a,button,[role="button"],div,span')));
+
+  for (const raw of candidates.slice(0,3500)) {{
+    if (!visible(raw)) continue;
+    const tile=raw.closest && raw.closest(tileSelector) || raw;
+    if (!visible(tile)) continue;
+    const text=norm(tile.innerText || tile.textContent || raw.innerText || raw.textContent);
+    if (!text || text.length>320 || !/(ROULETTE|RULET)/.test(text)) continue;
+    if (badCardText.test(text)) continue;
+    if (categoryLabels.has(text)) continue;
+
+    const hit=clickable(tile) || tile;
+    if (!hit || !visible(hit)) continue;
+    const label=norm(hit.innerText || hit.textContent || text).slice(0,260);
+    if (!/(ROULETTE|RULET)/.test(label) || badCardText.test(label)) continue;
+
+    let href=hrefOf(hit) || hrefOf(tile);
+    const testid=String(hit.getAttribute && hit.getAttribute('data-testid') || tile.getAttribute && tile.getAttribute('data-testid') || '');
+    let tableId=firstAttrInTree(hit, ['data-table-id','data-tableid','tableid','table-id','data-table_id']);
+    let gameId=firstAttrInTree(hit, ['data-gameid','data-game-id','gameid','game-id','data-game_id']);
+
+    if (href) {{
+      try {{
+        const u=new URL(href,location.href);
+        tableId = tableId || u.searchParams.get('tableId') || u.searchParams.get('table_id') || '';
+        gameId = gameId || u.searchParams.get('gameId') || u.searchParams.get('game_id') || u.searchParams.get('openGames') || '';
+        href = u.toString();
+      }} catch (_) {{}}
+    }}
+
+    // Many operator lobbies expose only data-gameid. Build a safe operator
+    // deep link so the collector can open the card in a hidden tab and let
+    // Pragmatic's own network calls reveal the real tableId.
+    if (!href && gameId) {{
+      try {{
+        const u=new URL(location.href);
+        u.searchParams.set('openGames', gameId);
+        u.searchParams.set('gameNames', label.replace(/\s+/g,' ').slice(0,120));
+        href=u.toString();
+      }} catch (_) {{}}
+    }}
+
+    const key=(tableId || gameId || href || label+'|'+testid).slice(0,420);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    cards.push({{key,label,href,testid,table_id:tableId,game_id:gameId}});
   }}
 
   const scrollCandidates=[];
@@ -6499,7 +6572,7 @@ def build_multi_table_nav_scan():
   return {{
     ok:true,
     mode:'provider_lobby',
-    stage:category?(selected(category)?'roulette-selected':'roulette-selecting'):'scanning',
+    stage:category?(categoryState==='selected'?'roulette-selected':'roulette-unconfirmed'):'scanning',
     cards,
     scrollTop,scrollHeight,clientHeight,atBottom,
     bodyLength:bodyText.length,
@@ -6536,12 +6609,17 @@ class ChromeBridge(threading.Thread):
         self.live_result_probe = {}
         self.table_scan_enabled = False
         self.table_scan_visited = set()
+        self.table_scan_found_ids = set()
         self.table_scan_no_progress = 0
         self.table_scan_last_scroll_height = 0
         self.table_scan_started = 0.0
         self.table_scan_last_view = 0.0
         self.table_scan_target_id = ""
         self.table_scan_entry_url = ""
+        self.table_scan_probe_queue = []
+        self.table_scan_probe_targets = {}
+        self.table_scan_probe_urls = set()
+        self.table_scan_probed_keys = set()
         for _tid, _row in (getattr(state, "table_registry", {}) or {}).items():
             self.collector_seen[str(_tid)] = {
                 "table_id": str(_tid),
@@ -6695,11 +6773,26 @@ class ChromeBridge(threading.Thread):
     def _is_collector_target_id(self, target_id):
         root = str(self.table_scan_target_id or "")
         tid = str(target_id or "")
-        if not root or not tid:
+        if not tid:
+            return False
+
+        def is_probe_target(tid_value):
+            probe_targets = getattr(self, "table_scan_probe_targets", {}) or {}
+            probe_urls = getattr(self, "table_scan_probe_urls", set()) or set()
+            if tid_value in probe_targets:
+                return True
+            info = self.target_info.get(tid_value, {}) or {}
+            url = str(info.get("url", "") or "")
+            return bool(url and url in probe_urls)
+
+        if is_probe_target(tid):
+            return True
+
+        if not root:
             return False
         seen = set()
         for _ in range(8):
-            if tid == root:
+            if tid == root or is_probe_target(tid):
                 return True
             if not tid or tid in seen:
                 return False
@@ -6716,23 +6809,36 @@ class ChromeBridge(threading.Thread):
         return self._is_collector_target_id(self._target_id_for_session(sid))
 
     def _close_table_scan_target(self):
-        tid = str(self.table_scan_target_id or "")
+        tids = []
+        root = str(self.table_scan_target_id or "")
+        if root:
+            tids.append(root)
+        tids.extend(list(self.table_scan_probe_targets.keys()))
         self.table_scan_target_id = ""
-        if tid and self.ws is not None:
-            try:
-                self.send("Target.closeTarget", {"targetId": tid})
-            except Exception:
-                pass
+        self.table_scan_probe_targets = {}
+        self.table_scan_probe_urls = set()
+        self.table_scan_probe_queue = []
+        if self.ws is not None:
+            for tid in tids:
+                try:
+                    self.send("Target.closeTarget", {"targetId": tid})
+                except Exception:
+                    pass
 
     def start_table_scan(self):
         self._close_table_scan_target()
         self.table_scan_enabled = True
         self.table_scan_visited = set()
+        self.table_scan_found_ids = set()
         self.table_scan_no_progress = 0
         self.table_scan_last_scroll_height = 0
         self.table_scan_started = time.time()
         self.table_scan_last_view = 0.0
         self.table_scan_entry_url = self._collector_launch_url()
+        self.table_scan_probe_queue = []
+        self.table_scan_probe_targets = {}
+        self.table_scan_probe_urls = set()
+        self.table_scan_probed_keys = set()
         self.send(
             "Target.createTarget",
             {"url": self.table_scan_entry_url, "background": True},
@@ -6751,6 +6857,74 @@ class ChromeBridge(threading.Thread):
         with self.state.lock:
             self.state.table_scan_status = f"MASA TARAMA: durdu • {reason}"
         return True
+
+    def _cleanup_table_scan_probes(self):
+        if not self.table_scan_probe_targets:
+            return
+        now = time.time()
+        close_ids = []
+        for tid, row in list(self.table_scan_probe_targets.items()):
+            opened = float(row.get("opened", 0.0) or 0.0)
+            seen_at = float(row.get("table_seen_at", 0.0) or 0.0)
+            if seen_at and now - seen_at >= 3.0:
+                close_ids.append(tid)
+            elif opened and now - opened >= COLLECTOR_PROBE_SECONDS:
+                close_ids.append(tid)
+        for tid in close_ids:
+            row = self.table_scan_probe_targets.pop(tid, None) or {}
+            url = str(row.get("url") or "")
+            if url:
+                self.table_scan_probe_urls.discard(url)
+            if self.ws is not None:
+                try:
+                    self.send("Target.closeTarget", {"targetId": tid})
+                except Exception:
+                    pass
+
+    def _queue_table_probe(self, row):
+        if not isinstance(row, dict):
+            return False
+        url = str(row.get("href") or "").strip()
+        label = str(row.get("label") or "").strip()
+        key = str(row.get("key") or url or label).strip()
+        if not url or not url.startswith(("http://", "https://")):
+            return False
+        if not key:
+            return False
+        if key in self.table_scan_probed_keys:
+            return False
+        if url in self.table_scan_probe_urls:
+            return False
+        if any(str(q.get("key") or "") == key for q in self.table_scan_probe_queue):
+            return False
+        self.table_scan_probe_queue.append({
+            "key": key,
+            "url": url,
+            "label": label[:160],
+            "queued": time.time(),
+        })
+        return True
+
+    def _pump_table_scan_probes(self):
+        if not self.table_scan_enabled or self.ws is None:
+            return
+        self._cleanup_table_scan_probes()
+        active = len(self.table_scan_probe_targets)
+        while active < COLLECTOR_PROBE_MAX_CONCURRENT and self.table_scan_probe_queue:
+            row = self.table_scan_probe_queue.pop(0)
+            key = str(row.get("key") or "")
+            url = str(row.get("url") or "")
+            if not url or not key or key in self.table_scan_probed_keys:
+                continue
+            self.table_scan_probed_keys.add(key)
+            self.table_scan_probe_urls.add(url)
+            self.send(
+                "Target.createTarget",
+                {"url": url, "background": True},
+                kind="collectorprobecreate",
+                context=row,
+            )
+            active += 1
 
     def browser_ws_url(self):
         with urllib.request.urlopen(
@@ -7176,6 +7350,7 @@ class ChromeBridge(threading.Thread):
 
         cards = [row for row in (value.get("cards") or []) if isinstance(row, dict)]
         before = len(self.table_scan_visited)
+        queued_probes = 0
         for row in cards:
             key = str(row.get("key") or "").strip()
             if not key:
@@ -7184,10 +7359,16 @@ class ChromeBridge(threading.Thread):
                 self.table_scan_visited.add(key)
             table_id = str(row.get("table_id") or "").strip()
             if table_id:
+                self.table_scan_found_ids.add(table_id)
                 self._register_discovered_tables([{
                     "table_id": table_id,
                     "display_name": str(row.get("label") or table_id),
                 }], source="PRAGMATIC LOBI KARTI")
+            elif self._queue_table_probe(row):
+                queued_probes += 1
+
+        if queued_probes:
+            self._pump_table_scan_probes()
 
         new_cards = len(self.table_scan_visited) - before
         try:
@@ -7206,19 +7387,30 @@ class ChromeBridge(threading.Thread):
         else:
             self.table_scan_no_progress = 0
 
+        self._pump_table_scan_probes()
+        probe_active = len(self.table_scan_probe_targets)
+        probe_waiting = len(self.table_scan_probe_queue)
+        scan_id_count = len(self.table_scan_found_ids)
         with self.state.lock:
-            table_count = len(self.state.table_registry)
-        if at_bottom and self.table_scan_no_progress >= 5:
+            bank_count = len(self.state.table_registry)
+        if (
+            at_bottom
+            and self.table_scan_no_progress >= 5
+            and probe_active == 0
+            and probe_waiting == 0
+        ):
             self.stop_table_scan(
                 f"lobi sonuna ulaşıldı • {len(self.table_scan_visited)} kart, "
-                f"{table_count} masa ID"
+                f"bu taramada {scan_id_count} masa ID • banka {bank_count}"
             )
             return
 
         with self.state.lock:
             self.state.table_scan_status = (
                 "MASA TARAMA: Rulet lobisi • "
-                f"{len(self.table_scan_visited)} kart / {table_count} masa ID • "
+                f"{len(self.table_scan_visited)} kart / bu taramada {scan_id_count} masa ID "
+                f"/ banka {bank_count} • "
+                f"giriş deneme {probe_active} aktif {probe_waiting} bekliyor • "
                 f"kaydırma {min(scroll_top + client_height, scroll_height)}/"
                 f"{scroll_height or 'bekleniyor'}"
             )
@@ -7439,6 +7631,13 @@ class ChromeBridge(threading.Thread):
                 display_name=title,
                 source="AÇIK PRAGMATIC MASA",
             )
+
+        if self._is_collector_session(sid):
+            self.table_scan_found_ids.add(table_id)
+            probe_tid = self._target_id_for_session(sid)
+            if probe_tid in self.table_scan_probe_targets:
+                self.table_scan_probe_targets[probe_tid]["table_id_seen"] = table_id
+                self.table_scan_probe_targets[probe_tid]["table_seen_at"] = now
 
         old = self.session_table_activity.get(sid, {})
         hits = (
@@ -7768,6 +7967,7 @@ class ChromeBridge(threading.Thread):
 
                 self._select_active_table()
                 self._collector_tick()
+                self._pump_table_scan_probes()
             except Exception:
                 pass
 
@@ -7846,6 +8046,8 @@ class ChromeBridge(threading.Thread):
                 })
                 merged.setdefault("last_requested", 0.0)
                 self.collector_seen[tid] = merged
+                if self.table_scan_enabled:
+                    self.table_scan_found_ids.add(tid)
                 if should_persist:
                     persist_rows.append((tid, name))
                 count += 1
@@ -8225,6 +8427,24 @@ class ChromeBridge(threading.Thread):
                             "MASA TARAMA: arka plan sekmesi açılamadı"
                         )
 
+            elif kind == "collectorprobecreate":
+                tid = str(obj.get("result", {}).get("targetId", "") or "")
+                meta = context if isinstance(context, dict) else {}
+                if tid and self.table_scan_enabled:
+                    row = dict(meta)
+                    row["opened"] = time.time()
+                    self.table_scan_probe_targets[tid] = row
+                    url = str(row.get("url") or "")
+                    if url:
+                        self.table_scan_probe_urls.add(url)
+                    ti = self.target_info.get(tid)
+                    if ti:
+                        self.attach_target(ti)
+                else:
+                    url = str(meta.get("url") or "")
+                    if url:
+                        self.table_scan_probe_urls.discard(url)
+
             elif kind == "attach":
                 tid = context
                 self.attaching.discard(tid)
@@ -8485,6 +8705,11 @@ class ChromeBridge(threading.Thread):
                     for tid in dead:
                         self.target_sessions.pop(tid, None)
                         self.target_parent.pop(tid, None)
+                        probe_row = self.table_scan_probe_targets.pop(tid, None)
+                        if probe_row:
+                            probe_url = str(probe_row.get("url") or "")
+                            if probe_url:
+                                self.table_scan_probe_urls.discard(probe_url)
                     self.session_targets.pop(child_sid, None)
             except Exception:
                 pass
@@ -8774,7 +8999,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.12 • Roulette Menu + Scroll Fix")
+        self.root.title("Roulette Pro AI V2.9.14 • Scan Fix + Risk EV")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -8945,7 +9170,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.13 RISK+EV",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.14 SCAN+RISK",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

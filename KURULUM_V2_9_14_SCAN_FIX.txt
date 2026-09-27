@@ -1,0 +1,26 @@
+ROULETTE PRO AI V2.9.14 SCAN+RISK KURULUM
+
+BU GÜNCELLEME NEYİ DÜZELTİR?
+- PRAGMATIC MASALARI TARA seçeneğinin "Rulet kategorisi seçiliyor" aşamasında
+  takılı kalmasını azaltır.
+- Kart sayısı ile gerçek masa ID sayısını ayırır.
+- Gerçek tableId görünmeyen kartları, kullanıcı masasını etkilemeden gizli
+  arka plan hedefinde kısa süre açıp tanımayı dener.
+- Eski banka toplamını o anki taramada bulunan masa sayısı gibi göstermez.
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları kendi program klasörüne kopyala.
+3. Sorarsa dosyaların üzerine yaz.
+4. Programı şu dosya ile çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Program üst başlığında V2.9.14 SCAN+RISK yazmalı.
+- Veri panelinde tarama sırasında şu formatı görmelisin:
+  kart / bu taramada X masa ID / banka Y
+
+NOT
+- BAT dosyasının adında V2_9_12 yazması sorun değildir.
+- Program bahis yapmaz; gizli arka plan hedefleri yalnız masa kimliği ve
+  statisticHistory erişimi tanımak için kullanılır.
