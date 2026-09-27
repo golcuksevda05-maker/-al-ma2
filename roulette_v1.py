@@ -8,6 +8,7 @@ import shutil
 import re
 import secrets
 import socket
+import ssl
 import subprocess
 import struct
 import sys
@@ -30,15 +31,21 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.23: lobby auto collector fallback.
-# If API refresh cannot read data, the program opens a dedicated Pragmatic
-# lobby collector tab, clicks visible roulette cards one by one, stores SON500,
-# and repeats every 10 minutes.
+# V2.9.24: Pragmatic DGA WebSocket collector.
+# GitHub research showed the stable multi-table feed is the Pragmatic Live
+# websocket (wss://dga.pragmaticplaylive.net/ws) with subscribe messages.
+# The program now learns casinoId/currency from Chrome websocket frames and
+# refreshes learned table banks from the feed before falling back to lobby clicks.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
 COLLECTOR_CARD_CLICK_SECONDS = 10.0
 TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
+DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
+DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
+DGA_DEFAULT_CURRENCY = "TRY"
+DGA_SUBSCRIBE_BATCH_SIZE = 80
+DGA_RECONNECT_SECONDS = 10.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -1019,8 +1026,10 @@ def predicted_number_neighbors(history, radius=2):
 
 
 class RawWebSocket:
-    def __init__(self, url):
+    def __init__(self, url, origin="", connect_timeout=5):
         self.url = url
+        self.origin = str(origin or "")
+        self.connect_timeout = float(connect_timeout or 5)
         self.sock = None
         self.lock = threading.Lock()
         self._connect()
@@ -1028,59 +1037,88 @@ class RawWebSocket:
     def _connect(self):
         u = urllib.parse.urlparse(self.url)
         host = u.hostname
-        port = u.port or 80
+        if not host:
+            raise RuntimeError("WebSocket host boş")
+        secure = (u.scheme or "ws").lower() == "wss"
+        port = u.port or (443 if secure else 80)
         path = u.path or "/"
         if u.query:
             path += "?" + u.query
 
-        s = socket.create_connection((host, port), timeout=5)
-        s.settimeout(None)
+        raw = socket.create_connection((host, port), timeout=self.connect_timeout)
+        raw.settimeout(None)
+        if secure:
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(raw, server_hostname=host)
+        else:
+            s = raw
 
         key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-        req = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        ).encode("ascii")
+        default_port = 443 if secure else 80
+        host_header = host if port == default_port else f"{host}:{port}"
+        headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host_header}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if self.origin:
+            headers.append(f"Origin: {self.origin}")
+        req = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii")
         s.sendall(req)
 
         response = b""
         while b"\r\n\r\n" not in response:
             chunk = s.recv(4096)
             if not chunk:
-                raise RuntimeError("Chrome DevTools bağlantısı açılamadı.")
+                raise RuntimeError("WebSocket bağlantısı açılamadı.")
             response += chunk
+            if len(response) > 65536:
+                raise RuntimeError("WebSocket handshake cevabı çok büyük")
 
         if b"101" not in response.split(b"\r\n", 1)[0]:
-            raise RuntimeError("Chrome DevTools websocket reddedildi.")
+            raise RuntimeError("WebSocket reddedildi.")
 
         self.sock = s
+
+    def settimeout(self, seconds):
+        try:
+            self.sock.settimeout(seconds)
+        except Exception:
+            pass
 
     def _read_exact(self, n):
         data = bytearray()
         while len(data) < n:
             chunk = self.sock.recv(n-len(data))
             if not chunk:
-                raise ConnectionError("DevTools bağlantısı kapandı.")
+                raise ConnectionError("WebSocket bağlantısı kapandı.")
             data.extend(chunk)
         return bytes(data)
 
-    def send_text(self, text):
-        payload = text.encode("utf-8")
+    def _send_frame(self, opcode, payload=b""):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        payload = bytes(payload or b"")
         with self.lock:
             mask = secrets.token_bytes(4)
             n = len(payload)
             if n < 126:
-                hdr = bytes([0x81, 0x80 | n])
+                hdr = bytes([0x80 | (opcode & 0x0F), 0x80 | n])
             elif n < 65536:
-                hdr = bytes([0x81, 0x80 | 126]) + struct.pack("!H", n)
+                hdr = bytes([0x80 | (opcode & 0x0F), 0x80 | 126]) + struct.pack("!H", n)
             else:
-                hdr = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", n)
+                hdr = bytes([0x80 | (opcode & 0x0F), 0x80 | 127]) + struct.pack("!Q", n)
             masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
             self.sock.sendall(hdr + mask + masked)
+
+    def send_text(self, text):
+        self._send_frame(0x1, str(text or ""))
+
+    def send_pong(self, payload=b""):
+        self._send_frame(0xA, payload)
 
     def recv_text(self):
         fragments = bytearray()
@@ -1103,8 +1141,15 @@ class RawWebSocket:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
             if opcode == 0x8:
-                raise ConnectionError("DevTools websocket kapandı.")
-            if opcode in (0x9, 0xA):
+                raise ConnectionError("WebSocket kapandı.")
+            if opcode == 0x9:
+                # Server ping; answer with pong so long-lived DGA feeds stay up.
+                try:
+                    self.send_pong(payload)
+                except Exception:
+                    pass
+                continue
+            if opcode == 0xA:
                 continue
 
             if opcode in (0x1, 0x2):
@@ -1116,14 +1161,21 @@ class RawWebSocket:
             if fin:
                 if current_opcode == 0x1:
                     return fragments.decode("utf-8", errors="replace")
+                if current_opcode == 0x2:
+                    return fragments.decode("utf-8", errors="ignore")
                 fragments.clear()
                 current_opcode = None
 
     def close(self):
         try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
             self.sock.close()
         except Exception:
             pass
+
 
 
 
@@ -6705,6 +6757,370 @@ def build_multi_table_nav_scan(clicked_keys=None):
 """
 
 
+def _dga_last20_numbers(last20):
+    nums = []
+    if not isinstance(last20, list):
+        return nums
+    for item in last20:
+        val = None
+        if isinstance(item, dict):
+            for key in ("result", "number", "value", "winningNumber"):
+                if key in item:
+                    val = item.get(key)
+                    break
+        else:
+            val = item
+        try:
+            n = int(val)
+        except Exception:
+            continue
+        if 0 <= n <= 36:
+            nums.append(n)
+    return nums
+
+
+def extract_dga_feed_tables(payload):
+    """Return [{table_id, display_name, nums}] from Pragmatic DGA websocket JSON."""
+    rows = []
+    seen = set()
+
+    def add(tid, name, nums):
+        tid = str(tid or "").strip()
+        if not tid or len(nums or []) < 1:
+            return
+        key = (tid, tuple(nums[:20]))
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({
+            "table_id": tid,
+            "display_name": str(name or tid).strip() or tid,
+            "nums": list(nums),
+        })
+
+    def walk(obj, hinted_tid="", hinted_name=""):
+        if isinstance(obj, dict):
+            table_obj = obj.get("pragmaticTable")
+            if isinstance(table_obj, dict):
+                tid_hint = hinted_tid
+                tcid = str(obj.get("tableAndCurrencyID") or "")
+                if tcid and not tid_hint:
+                    tid_hint = tcid.split(":", 1)[0]
+                walk(table_obj, tid_hint, hinted_name)
+
+            tid = str(
+                obj.get("tableId")
+                or obj.get("tableID")
+                or obj.get("table_id")
+                or hinted_tid
+                or ""
+            ).strip()
+            name = str(
+                obj.get("tableName")
+                or obj.get("table_name")
+                or obj.get("name")
+                or obj.get("languageSpecificTableInfo")
+                or hinted_name
+                or tid
+            ).strip()
+            nums = _dga_last20_numbers(obj.get("last20Results"))
+            if tid and nums:
+                add(tid, name, nums)
+
+            # Some delta frames nest the actual table state below generic keys.
+            for key, val in obj.items():
+                if key in (
+                    "pragmaticTable",
+                    "last20Results",
+                    "tableLimits",
+                    "dealer",
+                ):
+                    continue
+                if isinstance(val, (dict, list)):
+                    walk(val, tid or hinted_tid, name or hinted_name)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, hinted_tid, hinted_name)
+
+    walk(payload)
+    return rows
+
+
+class DgaLiveFeedCollector(threading.Thread):
+    def __init__(self, state):
+        super().__init__(daemon=True, name="PragmaticDgaLiveFeed")
+        self.state = state
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.enabled = False
+        self.ws_url = DGA_FEED_WS_URL
+        self.casino_id = ""
+        self.currency = ""
+        self.reason = ""
+        self.last_keys = {}
+        self.updated_tables = set()
+        self.received_frames = 0
+        self.connected = False
+        self.last_error = ""
+        self.individual_mode = False
+        self.currency_cycle = list(dict.fromkeys([
+            DGA_DEFAULT_CURRENCY, "USD", "EUR", "BRL", "CAD"
+        ]))
+        self.currency_index = 0
+
+    def configure(self, casino_id="", currency="", ws_url="", enable=True, reason=""):
+        with self.lock:
+            if casino_id:
+                self.casino_id = str(casino_id).strip()
+            if currency:
+                self.currency = str(currency).strip().upper()
+            if ws_url:
+                self.ws_url = str(ws_url).strip()
+            self.enabled = bool(enable)
+            if reason:
+                self.reason = str(reason)
+        if not self.is_alive():
+            try:
+                self.start()
+            except RuntimeError:
+                pass
+        self._set_status("DGA CANLI: başlatıldı • websocket bağlantısı hazırlanıyor")
+        return True
+
+    def stop_collection(self, reason="kullanıcı durdurdu"):
+        with self.lock:
+            self.enabled = False
+            self.connected = False
+        self._set_status(f"DGA CANLI: durdu • {reason}")
+
+    def _config(self):
+        with self.lock:
+            explicit_currency = bool(str(self.currency or "").strip())
+            cur = (
+                self.currency
+                if explicit_currency
+                else self.currency_cycle[self.currency_index % len(self.currency_cycle)]
+            )
+            return {
+                "enabled": bool(self.enabled),
+                "ws_url": self.ws_url or DGA_FEED_WS_URL,
+                "casino_id": self.casino_id or DGA_DEFAULT_CASINO_ID,
+                "currency": cur or DGA_DEFAULT_CURRENCY,
+                "explicit_currency": explicit_currency,
+                "reason": self.reason,
+            }
+
+    def _table_rows(self):
+        with self.state.lock:
+            rows = dict(getattr(self.state, "table_registry", {}) or {})
+        out = []
+        seen = set()
+        for tid, row in rows.items():
+            tid = str(tid or "").strip()
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append({
+                "table_id": tid,
+                "display_name": str((row or {}).get("display_name") or tid),
+            })
+        out.sort(key=lambda r: r["display_name"].lower())
+        return out
+
+    def _set_status(self, text):
+        try:
+            with self.state.lock:
+                self.state.table_scan_status = str(text)[:220]
+        except Exception:
+            pass
+
+    def _send_subscribe(self, ws, rows, casino_id, currency, individual=False):
+        ids = [str(r.get("table_id") or "").strip() for r in rows]
+        ids = [x for x in ids if x]
+        if not ids:
+            return 0
+        sent = 0
+        if individual:
+            for tid in ids:
+                msg = {
+                    "type": "subscribe",
+                    "isDeltaEnabled": True,
+                    "casinoId": casino_id,
+                    "key": tid,
+                    "currency": currency,
+                }
+                ws.send_text(json.dumps(msg, separators=(",", ":")))
+                sent += 1
+            return sent
+        for i in range(0, len(ids), max(1, int(DGA_SUBSCRIBE_BATCH_SIZE))):
+            batch = ids[i:i + max(1, int(DGA_SUBSCRIBE_BATCH_SIZE))]
+            msg = {
+                "type": "subscribe",
+                "isDeltaEnabled": True,
+                "casinoId": casino_id,
+                "key": batch,
+                "currency": currency,
+            }
+            ws.send_text(json.dumps(msg, separators=(",", ":")))
+            sent += len(batch)
+        return sent
+
+    def _handle_payload(self, payload, display_names=None):
+        rows = extract_dga_feed_tables(payload)
+        if not rows:
+            return 0
+        display_names = display_names or {}
+        applied = 0
+        now = time.time()
+        for row in rows:
+            tid = str(row.get("table_id") or "").strip()
+            nums = [int(x) for x in (row.get("nums") or []) if isinstance(x, int)]
+            if not tid or len(nums) < 3:
+                continue
+            key = tuple(nums[:20])
+            if self.last_keys.get(tid) == key:
+                continue
+            self.last_keys[tid] = key
+            name = str(row.get("display_name") or display_names.get(tid) or tid)
+            if len(nums) >= 20:
+                self.state.store_background_table_history(
+                    nums,
+                    table_id=tid,
+                    display_name=name,
+                    source_label="DGA WebSocket liveFeed",
+                )
+            else:
+                self.state.mark_table_discovered(tid, name, source="DGA WebSocket")
+            self.state.mark_table_attempt(tid, ok=True)
+            self.updated_tables.add(tid)
+            applied += 1
+        if applied:
+            sample = rows[0]
+            self._set_status(
+                f"DGA CANLI: {len(self.updated_tables)} masa güncellendi • "
+                f"son {sample.get('display_name') or sample.get('table_id')} • "
+                f"{time.strftime('%H:%M:%S')}"
+            )
+        return applied
+
+    def run(self):
+        while not self.stop_event.is_set():
+            cfg = self._config()
+            if not cfg["enabled"]:
+                time.sleep(0.8)
+                continue
+
+            rows = self._table_rows()
+            if not rows:
+                self._set_status("DGA CANLI: kayıtlı masa bankası yok")
+                time.sleep(2.0)
+                continue
+
+            casino_id = str(cfg["casino_id"] or DGA_DEFAULT_CASINO_ID)
+            currency = str(cfg["currency"] or DGA_DEFAULT_CURRENCY).upper()
+            ws_url = str(cfg["ws_url"] or DGA_FEED_WS_URL)
+            display_names = {r["table_id"]: r["display_name"] for r in rows}
+            using_default = not bool((self.casino_id or "").strip())
+
+            ws = None
+            try:
+                self._set_status(
+                    f"DGA CANLI: bağlanıyor • {len(rows)} masa • "
+                    f"casino {casino_id}{' yedek' if using_default else ''} • {currency}"
+                )
+                ws = RawWebSocket(ws_url, connect_timeout=8)
+                ws.settimeout(2.0)
+                with self.lock:
+                    self.connected = True
+                    self.last_error = ""
+                    self.individual_mode = False
+                sent = self._send_subscribe(ws, rows, casino_id, currency, individual=False)
+                self._set_status(
+                    f"DGA CANLI: bağlı • {sent} masa abone • veri bekleniyor"
+                )
+                started = time.time()
+                last_ping = 0.0
+                last_any = time.time()
+                individual_sent = False
+                snapshot_ids = [r["table_id"] for r in rows]
+
+                while not self.stop_event.is_set() and self._config()["enabled"]:
+                    now = time.time()
+                    if now - started >= TABLE_SCAN_AUTO_REFRESH_SECONDS:
+                        break
+                    current_ids = [r["table_id"] for r in self._table_rows()]
+                    current_cfg = self._config()
+                    if (
+                        current_ids != snapshot_ids
+                        or str(current_cfg.get("casino_id") or DGA_DEFAULT_CASINO_ID) != casino_id
+                        or str(current_cfg.get("currency") or DGA_DEFAULT_CURRENCY).upper() != currency
+                        or str(current_cfg.get("ws_url") or DGA_FEED_WS_URL) != ws_url
+                    ):
+                        break
+                    if now - last_ping >= 15.0:
+                        try:
+                            ws.send_text(json.dumps({
+                                "type": "ping",
+                                "pingTime": int(now * 1000),
+                            }, separators=(",", ":")))
+                        except Exception:
+                            raise
+                        last_ping = now
+                    try:
+                        raw = ws.recv_text()
+                    except socket.timeout:
+                        if not individual_sent and now - last_any >= 20.0:
+                            sent2 = self._send_subscribe(
+                                ws,
+                                rows,
+                                casino_id,
+                                currency,
+                                individual=True,
+                            )
+                            individual_sent = True
+                            with self.lock:
+                                self.individual_mode = True
+                            self._set_status(
+                                f"DGA CANLI: toplu abonelik sessiz • "
+                                f"{sent2} masa tek tek deneniyor"
+                            )
+                        elif individual_sent and now - last_any >= 45.0 and not cfg.get("explicit_currency"):
+                            with self.lock:
+                                self.currency_index += 1
+                            self._set_status(
+                                "DGA CANLI: veri gelmedi • başka para birimi deneniyor"
+                            )
+                            break
+                        continue
+                    if not raw:
+                        continue
+                    last_any = time.time()
+                    with self.lock:
+                        self.received_frames += 1
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        continue
+                    self._handle_payload(payload, display_names=display_names)
+            except Exception as exc:
+                with self.lock:
+                    self.connected = False
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                self._set_status(
+                    f"DGA CANLI: bağlantı hatası • {type(exc).__name__} • tekrar denenecek"
+                )
+                time.sleep(DGA_RECONNECT_SECONDS)
+            finally:
+                with self.lock:
+                    self.connected = False
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                time.sleep(1.0)
+
+
 class ChromeBridge(threading.Thread):
     TARGET_TYPES = {"page","iframe","worker","shared_worker","service_worker","other","webview"}
 
@@ -6735,6 +7151,11 @@ class ChromeBridge(threading.Thread):
         self.api_refresh_total = 0
         self.api_refresh_success = 0
         self.api_refresh_fail = 0
+        self.dga_ws_url = DGA_FEED_WS_URL
+        self.dga_casino_id = ""
+        self.dga_currency = ""
+        self.dga_frame_last_keys = {}
+        self.dga_feed = DgaLiveFeedCollector(state)
         self.manual_api_teach = False
         self.manual_api_teach_started = 0.0
         self.live_result_probe = {}
@@ -6897,6 +7318,123 @@ class ChromeBridge(threading.Thread):
             )
         return True
 
+    def start_dga_live_collection(self, reason="kayıtlı masa canlı feed"):
+        with self.state.lock:
+            count = len(getattr(self.state, "table_registry", {}) or {})
+        if not count:
+            with self.state.lock:
+                self.state.table_scan_status = "DGA CANLI: kayıtlı masa bankası yok"
+            return False
+        self.table_scan_auto_cycle = False
+        self.table_scan_next_cycle = 0.0
+        self.dga_feed.configure(
+            casino_id=self.dga_casino_id,
+            currency=self.dga_currency,
+            ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
+            enable=True,
+            reason=reason,
+        )
+        with self.state.lock:
+            self.state.table_scan_status = (
+                f"DGA CANLI: {count} kayıtlı masa için websocket feed başlatıldı"
+            )
+        return True
+
+    def _record_dga_config(self, casino_id="", currency="", ws_url="", source=""):
+        changed = False
+        casino_id = str(casino_id or "").strip()
+        currency = str(currency or "").strip().upper()
+        ws_url = str(ws_url or "").strip()
+        if ws_url and "dga." in ws_url.lower() and ws_url != self.dga_ws_url:
+            self.dga_ws_url = ws_url
+            changed = True
+        if casino_id and casino_id != self.dga_casino_id:
+            self.dga_casino_id = casino_id
+            changed = True
+        if currency and currency != self.dga_currency:
+            self.dga_currency = currency
+            changed = True
+        if changed:
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    "DGA CANLI: Chrome feed bilgisi yakalandı • "
+                    f"casino {self.dga_casino_id or '?'} • {self.dga_currency or '?'}"
+                )
+            # If the user already started DGA collection with the fallback id,
+            # update the running worker to the real operator parameters.
+            if getattr(self.dga_feed, "enabled", False):
+                self.dga_feed.configure(
+                    casino_id=self.dga_casino_id,
+                    currency=self.dga_currency,
+                    ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
+                    enable=True,
+                    reason=source or "Chrome DGA config",
+                )
+        return changed
+
+    def _handle_dga_ws_payload(self, payload_text, sid="", direction=""):
+        raw = str(payload_text or "")
+        if not raw:
+            return False
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return False
+        handled = False
+        if isinstance(payload, dict):
+            typ = str(payload.get("type") or "").lower()
+            casino_id = str(payload.get("casinoId") or payload.get("casinoID") or "").strip()
+            currency = str(payload.get("currency") or payload.get("currencyId") or "").strip()
+            if typ == "subscribe" or casino_id:
+                self._record_dga_config(
+                    casino_id=casino_id,
+                    currency=currency,
+                    ws_url=self.dga_ws_url,
+                    source="Chrome websocket subscribe",
+                )
+                keys = payload.get("key") or payload.get("keys") or []
+                if isinstance(keys, str):
+                    keys = [keys]
+                discovered = []
+                for key in keys if isinstance(keys, list) else []:
+                    tid = str(key or "").strip()
+                    if tid:
+                        discovered.append({"table_id": tid, "display_name": tid})
+                if discovered and not self.manual_api_teach:
+                    self._register_discovered_tables(discovered, source="DGA websocket subscribe")
+                handled = True
+        rows = extract_dga_feed_tables(payload)
+        if rows:
+            handled = True
+            for row in rows:
+                tid = str(row.get("table_id") or "").strip()
+                nums = [int(x) for x in (row.get("nums") or []) if isinstance(x, int)]
+                name = str(row.get("display_name") or tid)
+                if not tid:
+                    continue
+                if len(nums) >= 20:
+                    key = tuple(nums[:20])
+                    if self.dga_frame_last_keys.get(tid) == key:
+                        continue
+                    self.dga_frame_last_keys[tid] = key
+                    self.state.store_background_table_history(
+                        nums,
+                        table_id=tid,
+                        display_name=name,
+                        source_label="Chrome DGA WebSocket",
+                    )
+                    self.state.mark_table_attempt(tid, ok=True)
+                    with self.state.lock:
+                        self.state.table_scan_status = (
+                            f"DGA CANLI: Chrome feed veri aldı • {name[:48]}"
+                        )
+                else:
+                    self._register_discovered_tables(
+                        [{"table_id": tid, "display_name": name}],
+                        source="Chrome DGA WebSocket",
+                    )
+        return handled
+
     def _collector_launch_url(self):
         return PRAGMATIC_LOBBY_SCAN_URL
 
@@ -6963,6 +7501,14 @@ class ChromeBridge(threading.Thread):
                     pass
 
     def start_table_scan(self, auto_cycle=True):
+        with self.state.lock:
+            bank_count = len(getattr(self.state, "table_registry", {}) or {})
+        if bank_count:
+            # V2.9.24: the reliable multi-table path is DGA websocket feed.
+            # Do not repeat the fragile lobby-card click cycle when the bank
+            # already has learned table IDs.
+            return self.start_dga_live_collection("PRAGMATIC MASALARI TARA")
+
         self._close_table_scan_target()
         self.table_scan_auto_cycle = bool(auto_cycle)
         self.table_scan_next_cycle = 0.0
@@ -7001,6 +7547,10 @@ class ChromeBridge(threading.Thread):
         if manual_stop:
             self.table_scan_auto_cycle = False
             self.table_scan_next_cycle = 0.0
+            try:
+                self.dga_feed.stop_collection("kullanıcı durdurdu")
+            except Exception:
+                pass
         elif self.table_scan_auto_cycle:
             self.table_scan_next_cycle = time.time() + TABLE_SCAN_AUTO_REFRESH_SECONDS
         with self.state.lock:
@@ -7860,6 +8410,24 @@ class ChromeBridge(threading.Thread):
         try:
             u = urllib.parse.urlsplit(raw)
             qs = urllib.parse.parse_qs(u.query)
+            casino_id = str((
+                qs.get("casinoId")
+                or qs.get("casinoID")
+                or qs.get("casinoid")
+                or [""]
+            )[0] or "")
+            currency = str((
+                qs.get("currency")
+                or qs.get("currencyId")
+                or qs.get("currencyID")
+                or [""]
+            )[0] or "")
+            if casino_id or currency:
+                self._record_dga_config(
+                    casino_id=casino_id,
+                    currency=currency,
+                    source="Pragmatic URL",
+                )
             if "/api/ge/versions" in u.path.lower():
                 game = str((qs.get("operatorGameId") or [""])[0] or "")
                 if game and sid:
@@ -8481,6 +9049,10 @@ class ChromeBridge(threading.Thread):
         self.table_scan_enabled = False
         self.table_scan_auto_cycle = False
         self.table_scan_next_cycle = 0.0
+        try:
+            self.dga_feed.stop_collection("API öğren modu")
+        except Exception:
+            pass
         self._close_table_scan_target()
         self.manual_api_teach = True
         self.manual_api_teach_started = time.time()
@@ -8495,8 +9067,13 @@ class ChromeBridge(threading.Thread):
         return True
 
     def start_api_refresh_all(self):
-        """Force-refresh all known tableId banks through statisticHistory API."""
-        now = time.time()
+        """Refresh known tableId banks through Pragmatic DGA live websocket.
+
+        Earlier statisticHistory HTTP refreshes returned OK 0 on the user's
+        operator because the endpoint is bound to browser/runtime context. The
+        public GitHub examples for Pragmatic live roulette use the DGA websocket;
+        use that as the primary bank refresh path.
+        """
         rows = []
         with self.collector_lock:
             seen_rows = {
@@ -8523,29 +9100,33 @@ class ChromeBridge(threading.Thread):
                     "last_requested": 0.0,
                 })
         rows.sort(key=lambda row: row["display_name"].lower())
+
         with self.collector_lock:
-            templates = [
-                dict(row) for row in self.auth_templates.values()
-                if now - float(row.get("seen", 0.0) or 0.0) <= 900.0
-            ]
-            self.api_refresh_remaining = rows
+            self.api_refresh_remaining = []
             self.api_refresh_total = len(rows)
-            self.api_refresh_started = now
+            self.api_refresh_started = time.time()
             self.api_refresh_success = 0
             self.api_refresh_fail = 0
-            self.api_refresh_mode = bool(rows and templates)
+            self.api_refresh_mode = False
+            for row in rows:
+                tid = str(row.get("table_id") or "")
+                if tid:
+                    old = self.collector_seen.get(tid, {}) or {}
+                    merged_row = dict(old)
+                    merged_row.update(row)
+                    self.collector_seen[tid] = merged_row
+
+        if not rows:
+            with self.state.lock:
+                self.state.table_scan_status = "DGA CANLI: kayıtlı masa bankası yok"
+            return False
+
+        self.start_dga_live_collection("KAYITLI MASALARI API/DGA YENİLE")
         with self.state.lock:
-            if not rows:
-                self.state.table_scan_status = "API TOPLA: kayıtlı masa bankası yok"
-            elif not templates:
-                self.state.table_scan_status = (
-                    "API TOPLA: yetkili Pragmatic API şablonu yok • önce bir masa aç"
-                )
-            else:
-                self.state.table_scan_status = (
-                    f"API TOPLA: {len(rows)} kayıtlı masa kuyruğa alındı"
-                )
-        self._collector_tick()
+            self.state.table_scan_status = (
+                f"DGA CANLI: {len(rows)} kayıtlı masa aboneliği başladı • "
+                "yeni spin geldikçe arşive eklenecek"
+            )
         return True
 
     def _api_refresh_runtime_context(self):
@@ -9339,6 +9920,28 @@ class ChromeBridge(threading.Thread):
                 pass
             return
 
+        if method == "Network.webSocketCreated":
+            try:
+                url = str(params.get("url", "") or "")
+                if "dga." in url.lower() and "pragmatic" in url.lower():
+                    self._record_dga_config(ws_url=url, source="Chrome websocket created")
+            except Exception:
+                pass
+            return
+
+        if method in ("Network.webSocketFrameSent", "Network.webSocketFrameReceived"):
+            try:
+                response = params.get("response", {}) or {}
+                payload = str(response.get("payloadData", "") or "")
+                self._handle_dga_ws_payload(
+                    payload,
+                    sid=sid,
+                    direction="sent" if method.endswith("Sent") else "received",
+                )
+            except Exception:
+                pass
+            return
+
         if method == "Network.requestWillBeSent":
             try:
                 req_obj = params.get("request", {}) or {}
@@ -9623,7 +10226,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.23 • Lobby Auto Collector")
+        self.root.title("Roulette Pro AI V2.9.24 • DGA Live Feed")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9794,7 +10397,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.23 LOBBY AUTO",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.24 DGA LIVE",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -10026,7 +10629,7 @@ class App:
         scan_bar=tk.Frame(data,bg=self.PANEL)
         scan_bar.pack(fill="x",padx=8,pady=(0,5))
         tk.Button(
-            scan_bar,text="PRAGMATIC MASALARI TARA",command=self.start_table_scan_ui,
+            scan_bar,text="DGA CANLI / MASALARI TARA",command=self.start_table_scan_ui,
             font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.GREEN,
             activebackground=self.PANEL2,activeforeground=self.GREEN,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
@@ -10046,7 +10649,7 @@ class App:
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
         ).pack(side="left",fill="x",expand=True,padx=(0,2))
         tk.Button(
-            api_bar,text="KAYITLI MASALARI API'DEN YENİLE",command=self.start_api_refresh_ui,
+            api_bar,text="KAYITLI MASALARI DGA CANLI YENİLE",command=self.start_api_refresh_ui,
             font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.YELLOW,
             activebackground=self.PANEL2,activeforeground=self.GREEN,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
