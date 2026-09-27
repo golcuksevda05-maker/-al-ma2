@@ -30,9 +30,9 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.21: clean API learn + background refresh status.
-# Manual API learn records only actual opened Pragmatic tables, not bulk lobby
-# catalog rows, so the bank count matches the user's visited table count.
+# V2.9.22: Chrome-runtime API refresh.
+# API refresh first fetches statisticHistory inside the authenticated Chrome
+# Pragmatic context, then falls back to Python HTTP if needed.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -3254,6 +3254,73 @@ DIRECT_HISTORY_SCAN = r"""
     };
   }
 })()
+"""
+
+
+
+def build_table_api_history_fetch(table_id):
+    tid_json = json.dumps(str(table_id or ""))
+    return f"""
+(async () => {{
+  const wantedTableId = {tid_json};
+  const resources = performance.getEntriesByType('resource').map(x => x.name || '');
+  const reversed = [...resources].reverse();
+
+  let historyUrl = reversed.find(
+    u => /\/api\/ui\/statisticHistory\?/i.test(u) && /JSESSIONID=/i.test(u)
+  ) || '';
+
+  if (!historyUrl) {{
+    const statsUrl = reversed.find(
+      u => /\/api\/ui\/stats\?/i.test(u) && /JSESSIONID=/i.test(u)
+    ) || '';
+    if (statsUrl) {{
+      try {{
+        const u = new URL(statsUrl);
+        u.pathname = u.pathname.replace(/\/stats$/i, '/statisticHistory');
+        historyUrl = u.toString();
+      }} catch (_) {{}}
+    }}
+  }}
+
+  if (!historyUrl) {{
+    const apiSeed = reversed.find(raw => {{
+      try {{
+        const u = new URL(raw);
+        return /^https?:$/i.test(u.protocol) &&
+               /(^|\.)games\./i.test(u.hostname) &&
+               /\/api\//i.test(u.pathname) &&
+               u.searchParams.has('JSESSIONID');
+      }} catch (_) {{ return false; }}
+    }}) || '';
+    if (apiSeed) {{
+      try {{
+        const u = new URL(apiSeed);
+        u.pathname = '/api/ui/statisticHistory';
+        historyUrl = u.toString();
+      }} catch (_) {{}}
+    }}
+  }}
+
+  if (!historyUrl || !wantedTableId) {{
+    return {{ok:false, reason:'API şablonu veya tableId yok', tableId:wantedTableId, title:document.title||''}};
+  }}
+
+  try {{
+    const u = new URL(historyUrl);
+    const keepSession = u.searchParams.get('JSESSIONID') || '';
+    u.search = '';
+    if (keepSession) u.searchParams.set('JSESSIONID', keepSession);
+    u.searchParams.set('numberOfGames', '500');
+    u.searchParams.set('tableId', wantedTableId);
+
+    const r = await fetch(u.toString(), {{credentials:'include', cache:'no-store'}});
+    const body = await r.text();
+    return {{ok:!!r.ok, status:r.status, tableId:wantedTableId, title:document.title||'', body}};
+  }} catch (e) {{
+    return {{ok:false, reason:String(e && e.message || e || 'fetch failed'), tableId:wantedTableId, title:document.title||''}};
+  }}
+}})()
 """
 
 VISIBILITY_SCAN = r"""
@@ -8453,6 +8520,84 @@ class ChromeBridge(threading.Thread):
         self._collector_tick()
         return True
 
+    def _api_refresh_runtime_context(self):
+        """Pick a Chrome Runtime context that can fetch Pragmatic games APIs."""
+        candidates = []
+        sids = []
+        if self.active_game_sid:
+            sids.append(self.active_game_sid)
+        sids.extend([sid for sid in self.session_info.keys() if sid not in sids])
+        for sid in sids:
+            if self._is_collector_session(sid):
+                continue
+            if not self.is_direct_probe_target(sid):
+                continue
+            info = self.session_info.get(sid, {}) or {}
+            url = str(info.get("url", "") or "").lower()
+            title = str(info.get("title", "") or "").lower()
+            base_score = 0
+            if sid == self.active_game_sid:
+                base_score += 1000
+            if "pragmatic" in url or "pragmatic" in title:
+                base_score += 100
+            if "roulette" in url or "rulet" in url or "roulette" in title or "rulet" in title:
+                base_score += 80
+            contexts = list((self.execution_contexts.get(sid) or {}).values())
+            for ctx in contexts:
+                cid = ctx.get("id")
+                origin = str(ctx.get("origin") or "").lower()
+                if cid is None:
+                    continue
+                score = base_score
+                if "games." in origin:
+                    score += 500
+                if origin.startswith(("http://", "https://")):
+                    score += 20
+                candidates.append((score, sid, int(cid)))
+            candidates.append((base_score, sid, None))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda row: -row[0])
+        _score, sid, cid = candidates[0]
+        return sid, cid
+
+    def _start_api_refresh_runtime_request(self, row):
+        tid = str((row or {}).get("table_id") or "").strip()
+        if not tid:
+            return False
+        sid, context_id = self._api_refresh_runtime_context()
+        if not sid:
+            return False
+        key = ("runtime", tid)
+        now = time.time()
+        with self.collector_lock:
+            if key in self.collector_inflight:
+                return False
+            self.collector_inflight.add(key)
+        self.state.mark_table_attempt(tid)
+        params = {
+            "expression": build_table_api_history_fetch(tid),
+            "returnByValue": True,
+            "awaitPromise": True,
+        }
+        if context_id is not None:
+            params["contextId"] = int(context_id)
+        self.send(
+            "Runtime.evaluate",
+            params,
+            session_id=sid,
+            kind="apirefreshruntime",
+            context={
+                "table_id": tid,
+                "display_name": str((row or {}).get("display_name") or tid),
+                "key": key,
+                "session": sid,
+                "context_id": context_id,
+                "started": now,
+            },
+        )
+        return True
+
     def _collector_tick(self):
         now = time.time()
         with self.collector_lock:
@@ -8489,7 +8634,10 @@ class ChromeBridge(threading.Thread):
                 if available <= 0:
                     kept.append(row)
                     continue
-                if self._start_background_history_request(
+                if self._start_api_refresh_runtime_request(row):
+                    available -= 1
+                    dispatched += 1
+                elif self._start_background_history_request(
                     template,
                     row.get("table_id", ""),
                     row.get("display_name", ""),
@@ -8498,8 +8646,8 @@ class ChromeBridge(threading.Thread):
                     available -= 1
                     dispatched += 1
                 else:
-                    # If already inflight, keep it out of the immediate queue;
-                    # the API refresh will continue on the next tick.
+                    # If already inflight or no suitable context yet, keep it
+                    # queued; the API refresh will continue on the next tick.
                     kept.append(row)
             with self.collector_lock:
                 self.api_refresh_remaining = kept
@@ -8864,7 +9012,47 @@ class ChromeBridge(threading.Thread):
             elif kind == "directhistory":
                 self.handle_direct_runtime(obj, context)
 
-            elif kind == "lobbyteach":
+            elif kind == "apirefreshruntime":
+                meta = context if isinstance(context, dict) else {}
+                tid = str(meta.get("table_id") or "")
+                key = meta.get("key") or ("runtime", tid)
+                ok = False
+                err = ""
+                try:
+                    value = obj.get("result", {}).get("result", {}).get("value")
+                    if not isinstance(value, dict):
+                        err = "runtime cevap yok"
+                    elif value.get("ok") and value.get("body"):
+                        nums = extract_statistic_history(value.get("body"))
+                        if len(nums) >= 20:
+                            self.state.store_background_table_history(
+                                nums,
+                                table_id=tid or value.get("tableId", ""),
+                                display_name=str(meta.get("display_name") or value.get("title") or tid),
+                                source_label="API REFRESH runtime fetch",
+                            )
+                            self.state.mark_table_attempt(tid, ok=True)
+                            ok = True
+                        else:
+                            err = f"sonuç ayrıştırılamadı ({len(nums)})"
+                    else:
+                        err = str(
+                            (value or {}).get("reason")
+                            or f"HTTP {(value or {}).get('status','-')}"
+                        )
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+                finally:
+                    with self.collector_lock:
+                        self.collector_inflight.discard(key)
+                        if ok:
+                            self.api_refresh_success = int(getattr(self, "api_refresh_success", 0) or 0) + 1
+                        else:
+                            self.api_refresh_fail = int(getattr(self, "api_refresh_fail", 0) or 0) + 1
+                    if not ok and tid:
+                        self.state.mark_table_attempt(tid, error=err[:160])
+
+            elif kind == "lobbyteach": 
                 try:
                     value = obj.get("result",{}).get("result",{}).get("value")
                     self._handle_lobby_teach(str(context or ""), value)
@@ -9399,7 +9587,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.21 • Clean API Learn")
+        self.root.title("Roulette Pro AI V2.9.22 • Runtime API")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9570,7 +9758,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.21 CLEAN API",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.22 RUNTIME API",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
