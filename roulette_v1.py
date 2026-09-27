@@ -30,12 +30,14 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.16: controlled table-tab pipeline.
-# Opens only operator-wrapper URLs built from visible lobby cards. Initial burst
-# can open the first visible row, then it settles to a small rolling queue.
-COLLECTOR_PROBE_INITIAL_CONCURRENT = 4
-COLLECTOR_PROBE_STEADY_CONCURRENT = 2
-COLLECTOR_PROBE_SECONDS = 35.0
+# V2.9.17: single collector-tab click pipeline.
+# Extra tab opening is disabled because some sites redirect those tabs to the
+# operator home page. The background collector tab clicks visible lobby cards
+# one by one, waits for Pragmatic network/tableId, then returns to the lobby.
+COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
+COLLECTOR_PROBE_STEADY_CONCURRENT = 0
+COLLECTOR_PROBE_SECONDS = 12.0
+COLLECTOR_CARD_CLICK_SECONDS = 24.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -6342,11 +6344,16 @@ HISTORY500_SCAN = r"""
 """
 
 
-def build_multi_table_nav_scan():
+def build_multi_table_nav_scan(clicked_keys=None):
+    clicked_json = json.dumps(
+        [str(x) for x in list(clicked_keys or [])[:2500]],
+        ensure_ascii=False,
+    )
     return rf"""
 (() => {{
   const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[İı]/g, 'I').replace(/\s+/g, ' ').trim().toUpperCase();
+  const PY_CLICKED_KEYS = new Set({clicked_json});
   const visible = el => {{
     if (!el) return false;
     const r=el.getBoundingClientRect(), s=getComputedStyle(el);
@@ -6457,6 +6464,7 @@ def build_multi_table_nav_scan():
   }}
 
   const cards=[];
+  const cardHits=[];
   const seen=new Set();
   const badCardText=/TOURNAMENT|HISTORY|SON 500|LAST 500|BLACKJACK|BACCARAT|POKER|AUTO PLAY|OTOMATIK OYUN|BAHIS|BET|CHIP|ÇIP/;
   function attrAny(el,names) {{
@@ -6536,6 +6544,44 @@ def build_multi_table_nav_scan():
     if (!key || seen.has(key)) continue;
     seen.add(key);
     cards.push({{key,label,href,testid,table_id:tableId,game_id:gameId}});
+    cardHits.push({{key,label,hit}});
+  }}
+
+  if (!scanState.clickedKeys) scanState.clickedKeys = {{}};
+  const nowMs = Date.now();
+  const clickReady = nowMs - Number(scanState.lastCardClickAt || 0) >= 2500;
+  if (cardHits.length && clickReady) {{
+    const next = cardHits.find(c => !PY_CLICKED_KEYS.has(c.key) && !scanState.clickedKeys[c.key]);
+    if (next) {{
+      scanState.clickedKeys[next.key] = nowMs;
+      scanState.lastCardClickAt = nowMs;
+      try {{
+        next.hit.scrollIntoView({{block:'center', inline:'center'}});
+      }} catch (_) {{}}
+      try {{
+        next.hit.click();
+        return {{
+          ok:true,
+          mode:'card_clicked',
+          stage:'card-clicked',
+          clickedKey:next.key,
+          clickedLabel:next.label,
+          cards,
+          title,url:href
+        }};
+      }} catch (e) {{
+        return {{
+          ok:false,
+          mode:'provider_lobby',
+          stage:'card-click-failed',
+          clickedKey:next.key,
+          clickedLabel:next.label,
+          reason:String(e),
+          cards,
+          title,url:href
+        }};
+      }}
+    }}
   }}
 
   const scrollCandidates=[];
@@ -6620,6 +6666,9 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_targets = {}
         self.table_scan_probe_urls = set()
         self.table_scan_probed_keys = set()
+        self.table_scan_clicked_keys = set()
+        self.table_scan_click_deadlines = {}
+        self.table_scan_last_clicked_label = ""
         for _tid, _row in (getattr(state, "table_registry", {}) or {}).items():
             self.collector_seen[str(_tid)] = {
                 "table_id": str(_tid),
@@ -6818,6 +6867,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_targets = {}
         self.table_scan_probe_urls = set()
         self.table_scan_probe_queue = []
+        self.table_scan_click_deadlines = {}
         if self.ws is not None:
             for tid in tids:
                 try:
@@ -6839,6 +6889,9 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_targets = {}
         self.table_scan_probe_urls = set()
         self.table_scan_probed_keys = set()
+        self.table_scan_clicked_keys = set()
+        self.table_scan_click_deadlines = {}
+        self.table_scan_last_clicked_label = ""
         self.send(
             "Target.createTarget",
             {"url": self.table_scan_entry_url, "background": True},
@@ -6857,6 +6910,32 @@ class ChromeBridge(threading.Thread):
         with self.state.lock:
             self.state.table_scan_status = f"MASA TARAMA: durdu • {reason}"
         return True
+
+    def _return_collector_to_lobby(self, sid, reason="sıradaki masa"):
+        if not sid or self.ws is None:
+            return False
+        url = str(self.table_scan_entry_url or self._collector_launch_url() or "")
+        if not url:
+            return False
+        self.table_scan_click_deadlines.pop(sid, None)
+        tid = self._target_id_for_session(sid)
+        root = str(self.table_scan_target_id or "")
+        try:
+            if tid and root and tid != root:
+                self.send("Target.closeTarget", {"targetId": tid})
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"MASA TARAMA: {reason} • yan hedef kapatılıyor"
+                    )
+            else:
+                self.send("Page.navigate", {"url": url}, session_id=sid)
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"MASA TARAMA: {reason} • lobiye dönülüyor"
+                    )
+            return True
+        except Exception:
+            return False
 
     def _cleanup_table_scan_probes(self):
         if not self.table_scan_probe_targets:
@@ -7393,6 +7472,33 @@ class ChromeBridge(threading.Thread):
                 self.state.table_scan_status = f"MASA TARAMA: {message}"
             return
 
+        if mode == "card_clicked":
+            clicked_key = str(value.get("clickedKey") or "").strip()
+            clicked_label = str(value.get("clickedLabel") or "").strip()
+            if clicked_key:
+                self.table_scan_clicked_keys.add(clicked_key)
+            if clicked_label:
+                self.table_scan_last_clicked_label = clicked_label
+            for row in [r for r in (value.get("cards") or []) if isinstance(r, dict)]:
+                key = str(row.get("key") or "").strip()
+                if key:
+                    self.table_scan_visited.add(key)
+                table_id = str(row.get("table_id") or "").strip()
+                if table_id:
+                    self.table_scan_found_ids.add(table_id)
+                    self._register_discovered_tables([{
+                        "table_id": table_id,
+                        "display_name": str(row.get("label") or table_id),
+                    }], source="PRAGMATIC LOBI KARTI")
+            self.table_scan_click_deadlines[sid] = now + COLLECTOR_CARD_CLICK_SECONDS
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    "MASA TARAMA: masa kartı açıldı • "
+                    + (clicked_label[:60] if clicked_label else "veri bekleniyor")
+                    + " • tableId yakalanınca lobiye dönülecek"
+                )
+            return
+
         if mode != "provider_lobby":
             return
 
@@ -7458,10 +7564,11 @@ class ChromeBridge(threading.Thread):
             if self.table_scan_found_ids
             else COLLECTOR_PROBE_INITIAL_CONCURRENT
         )
+        remaining_clicks = max(0, len(self.table_scan_visited) - len(self.table_scan_clicked_keys))
         probe_text = (
-            f"sekme hattı {probe_active}/{active_limit} aktif {probe_waiting} bekliyor • "
+            f"ek sekme hattı {probe_active}/{active_limit} aktif {probe_waiting} bekliyor • "
             if active_limit > 0
-            else "gizli sekme açma kapalı • "
+            else f"tek sekme tıklama • kalan görünen {remaining_clicks} • "
         )
         with self.state.lock:
             self.state.table_scan_status = (
@@ -7692,6 +7799,7 @@ class ChromeBridge(threading.Thread):
 
         if self._is_collector_session(sid):
             self.table_scan_found_ids.add(table_id)
+            self.table_scan_click_deadlines[sid] = now + 2.5
             probe_tid = self._target_id_for_session(sid)
             if probe_tid in self.table_scan_probe_targets:
                 self.table_scan_probe_targets[probe_tid]["table_id_seen"] = table_id
@@ -7853,6 +7961,12 @@ class ChromeBridge(threading.Thread):
                         )
 
                 for sid in list(self.session_info.keys()):
+                    if self.table_scan_enabled and self._is_collector_session(sid):
+                        due = float(self.table_scan_click_deadlines.get(sid, 0.0) or 0.0)
+                        if due and now >= due:
+                            self._return_collector_to_lobby(sid, "masa denemesi tamamlandı")
+                            continue
+
                     if self.is_direct_probe_target(sid):
                         if now - float(last_visibility_scan.get(sid, 0.0)) >= 1.5:
                             last_visibility_scan[sid] = now
@@ -8006,7 +8120,7 @@ class ChromeBridge(threading.Thread):
                                 continue
                             last_table_nav_scan[scan_key] = now
                             params = {
-                                "expression": build_multi_table_nav_scan(),
+                                "expression": build_multi_table_nav_scan(self.table_scan_clicked_keys),
                                 "returnByValue": True,
                                 "awaitPromise": True,
                             }
@@ -9057,7 +9171,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.16 • Table Pipeline + Risk EV")
+        self.root.title("Roulette Pro AI V2.9.17 • Single Tab Click Scan")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9228,7 +9342,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.16 TABLE PIPE",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.17 CLICK SCAN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

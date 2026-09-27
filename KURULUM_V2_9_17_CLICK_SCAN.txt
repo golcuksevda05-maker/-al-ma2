@@ -1,0 +1,23 @@
+ROULETTE PRO AI V2.9.17 CLICK SCAN KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları kendi program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Eski sürümden kalmış gereksiz ana sayfa / Pragmatic Lobby sekmeleri varsa
+   kapat.
+5. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.17 CLICK SCAN yazmalı.
+- PRAGMATIC MASALARI TARA sırasında durum satırında şunları görebilirsin:
+  * masa kartı açıldı
+  * masa denemesi tamamlandı • lobiye dönülüyor
+  * tek sekme tıklama • kalan görünen X
+
+NOT
+- Bu sürüm yeni sekmelerle ana sayfaya gitmeye çalışmaz.
+- Görünen lobi kartları tek tek arka plan/collector sekmesi içinde tıklanır.
+- Lobi en alta ulaştıktan sonra kullanıcı yukarı kaydırırsa program tekrar
+  aşağı çekmez.
