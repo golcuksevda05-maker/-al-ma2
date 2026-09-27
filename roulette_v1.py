@@ -30,12 +30,12 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.15: hidden card-opening probes are disabled by default.
-# They created extra Pragmatic Lobby tabs on some sites and could stay on the
-# provider splash screen. Table discovery now uses lobby DOM/network metadata
-# and direct statisticHistory templates only.
-COLLECTOR_PROBE_MAX_CONCURRENT = 0
-COLLECTOR_PROBE_SECONDS = 12.0
+# V2.9.16: controlled table-tab pipeline.
+# Opens only operator-wrapper URLs built from visible lobby cards. Initial burst
+# can open the first visible row, then it settles to a small rolling queue.
+COLLECTOR_PROBE_INITIAL_CONCURRENT = 4
+COLLECTOR_PROBE_STEADY_CONCURRENT = 2
+COLLECTOR_PROBE_SECONDS = 35.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -6560,7 +6560,11 @@ def build_multi_table_nav_scan():
     scrollHeight=scrollTarget.scrollHeight;
     clientHeight=scrollTarget.clientHeight;
     atBottom=scrollTop+clientHeight>=scrollHeight-8;
-    if (!atBottom) {{
+    if (atBottom) scanState.atBottomSeen = true;
+    // V2.9.16: after the scanner reaches bottom once, do not force-scroll
+    // down again. This lets the user manually scroll upward without the
+    // program pulling the lobby back to the bottom.
+    if (!atBottom && !scanState.atBottomSeen) {{
       scrollTarget.scrollBy({{top:Math.max(360,Math.floor(clientHeight*0.72)),behavior:'instant'}});
     }}
   }}
@@ -6877,14 +6881,50 @@ class ChromeBridge(threading.Thread):
                 except Exception:
                     pass
 
+    def _operator_table_probe_url(self, game_id, label=""):
+        gid = str(game_id or "").strip()
+        if not gid:
+            return ""
+        base = str(self.table_scan_entry_url or PRAGMATIC_LOBBY_SCAN_URL)
+        try:
+            u = urllib.parse.urlsplit(base)
+            qs = urllib.parse.parse_qsl(u.query, keep_blank_values=False)
+            drop = {"opengames", "gamenames", "gameid", "tableid", "table_id"}
+            cleaned = [(k, v) for k, v in qs if str(k).lower() not in drop]
+            cleaned.append(("openGames", gid))
+            cleaned.append(("gameNames", str(label or "Roulette")[:120]))
+            return urllib.parse.urlunsplit((
+                u.scheme,
+                u.netloc,
+                u.path or "/",
+                urllib.parse.urlencode(cleaned, doseq=True),
+                "",
+            ))
+        except Exception:
+            return ""
+
     def _queue_table_probe(self, row):
         if not isinstance(row, dict):
             return False
-        if COLLECTOR_PROBE_MAX_CONCURRENT <= 0:
+        if COLLECTOR_PROBE_INITIAL_CONCURRENT <= 0:
             return False
-        url = str(row.get("href") or "").strip()
+        href = str(row.get("href") or "").strip()
         label = str(row.get("label") or "").strip()
-        key = str(row.get("key") or url or label).strip()
+        game_id = str(row.get("game_id") or "").strip()
+        key = str(row.get("key") or game_id or href or label).strip()
+
+        url = href if href.startswith(("http://", "https://")) else ""
+        # Direct games.* / provider-lobby URLs can stay on a black splash
+        # screen. Prefer the operator wrapper URL when game_id is available.
+        try:
+            host = urllib.parse.urlsplit(url).hostname or ""
+            if game_id and host.lower().startswith("games."):
+                url = ""
+        except Exception:
+            pass
+        if not url and game_id:
+            url = self._operator_table_probe_url(game_id, label)
+
         if not url or not url.startswith(("http://", "https://")):
             return False
         if not key:
@@ -6899,6 +6939,7 @@ class ChromeBridge(threading.Thread):
             "key": key,
             "url": url,
             "label": label[:160],
+            "game_id": game_id,
             "queued": time.time(),
         })
         return True
@@ -6907,11 +6948,17 @@ class ChromeBridge(threading.Thread):
         if not self.table_scan_enabled or self.ws is None:
             return
         self._cleanup_table_scan_probes()
-        if COLLECTOR_PROBE_MAX_CONCURRENT <= 0:
+        active = len(self.table_scan_probe_targets)
+        limit = (
+            COLLECTOR_PROBE_STEADY_CONCURRENT
+            if self.table_scan_found_ids
+            else COLLECTOR_PROBE_INITIAL_CONCURRENT
+        )
+        limit = max(0, int(limit or 0))
+        if limit <= 0:
             self.table_scan_probe_queue = []
             return
-        active = len(self.table_scan_probe_targets)
-        while active < COLLECTOR_PROBE_MAX_CONCURRENT and self.table_scan_probe_queue:
+        while active < limit and self.table_scan_probe_queue:
             row = self.table_scan_probe_queue.pop(0)
             key = str(row.get("key") or "")
             url = str(row.get("url") or "")
@@ -7406,9 +7453,14 @@ class ChromeBridge(threading.Thread):
             )
             return
 
+        active_limit = (
+            COLLECTOR_PROBE_STEADY_CONCURRENT
+            if self.table_scan_found_ids
+            else COLLECTOR_PROBE_INITIAL_CONCURRENT
+        )
         probe_text = (
-            f"gizli tanıma {probe_active} aktif {probe_waiting} bekliyor • "
-            if COLLECTOR_PROBE_MAX_CONCURRENT > 0
+            f"sekme hattı {probe_active}/{active_limit} aktif {probe_waiting} bekliyor • "
+            if active_limit > 0
             else "gizli sekme açma kapalı • "
         )
         with self.state.lock:
@@ -9005,7 +9057,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.15 • Safe Scan + Risk EV")
+        self.root.title("Roulette Pro AI V2.9.16 • Table Pipeline + Risk EV")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9176,7 +9228,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.15 SAFE SCAN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.16 TABLE PIPE",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

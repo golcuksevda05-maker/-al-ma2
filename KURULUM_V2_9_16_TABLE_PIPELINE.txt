@@ -1,0 +1,25 @@
+ROULETTE PRO AI V2.9.16 TABLE PIPELINE KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları kendi program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Önceden takılı kalmış siyah Pragmatic Play Lobby sekmeleri varsa kapat.
+5. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üstte V2.9.16 TABLE PIPE yazmalı.
+- PRAGMATIC MASALARI TARA'ya basınca durum satırında şuna benzer yazı görünmeli:
+  MASA TARAMA: Rulet lobisi • 32 kart / bu taramada X gerçek masa ID / kayıtlı banka Y • sekme hattı A/B aktif C bekliyor
+
+DAVRANIŞ
+- Lobi en alta bir kez indikten sonra kullanıcı yukarı kaydırırsa program tekrar
+  zorla aşağı çekmez.
+- İlk aşamada 4 görünür masa sekmesi denenir.
+- İlk gerçek masa kimliği yakalandıktan sonra hat 2 aktif sekme ile devam eder.
+- Veri veren veya zaman aşımına düşen sekmeler otomatik kapanır; sıradaki masa
+  kuyruğa girer.
+
+NOT
+- BAT dosyasının adında V2_9_12 yazması normaldir.
