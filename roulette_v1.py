@@ -6652,6 +6652,10 @@ class ChromeBridge(threading.Thread):
         self.collector_inflight = set()
         self.collector_lock = threading.Lock()
         self.collector_last_start = 0.0
+        self.api_refresh_mode = False
+        self.api_refresh_remaining = []
+        self.api_refresh_started = 0.0
+        self.api_refresh_total = 0
         self.live_result_probe = {}
         self.table_scan_enabled = False
         self.table_scan_visited = set()
@@ -8254,7 +8258,7 @@ class ChromeBridge(threading.Thread):
             self.state.mark_table_discovered(tid, name, source=source)
         return count
 
-    def _start_background_history_request(self, template, table_id, display_name=""):
+    def _start_background_history_request(self, template, table_id, display_name="", force=False):
         if not isinstance(template, dict):
             return False
         tid = str(table_id or "").strip()
@@ -8270,7 +8274,7 @@ class ChromeBridge(threading.Thread):
             registry_row = dict(self.state.table_registry.get(tid, {}) or {})
         last_success = float(registry_row.get("last_update_epoch", 0.0) or 0.0)
         last_attempt = float(registry_row.get("last_attempt_epoch", 0.0) or 0.0)
-        if not collector_refresh_due(
+        if not force and not collector_refresh_due(
             now,
             last_success,
             last_attempt,
@@ -8281,7 +8285,7 @@ class ChromeBridge(threading.Thread):
             if key in self.collector_inflight:
                 return False
             seen = self.collector_seen.setdefault(tid, {})
-            if now - float(seen.get("last_requested", 0.0) or 0.0) < 1.0:
+            if not force and now - float(seen.get("last_requested", 0.0) or 0.0) < 1.0:
                 return False
             seen["last_requested"] = now
             self.collector_inflight.add(key)
@@ -8350,6 +8354,58 @@ class ChromeBridge(threading.Thread):
         ).start()
         return True
 
+    def start_api_refresh_all(self):
+        """Force-refresh all known tableId banks through statisticHistory API."""
+        now = time.time()
+        rows = []
+        with self.collector_lock:
+            seen_rows = {
+                str(k): dict(v or {})
+                for k, v in (self.collector_seen or {}).items()
+            }
+        with self.state.lock:
+            registry_rows = {
+                str(k): dict(v or {})
+                for k, v in (self.state.table_registry or {}).items()
+            }
+        merged = {}
+        merged.update(seen_rows)
+        for tid, row in registry_rows.items():
+            old = dict(merged.get(tid, {}) or {})
+            old.update(row)
+            old.setdefault("table_id", tid)
+            merged[tid] = old
+        for tid, row in merged.items():
+            if str(tid).strip():
+                rows.append({
+                    "table_id": str(tid).strip(),
+                    "display_name": str(row.get("display_name") or tid),
+                    "last_requested": 0.0,
+                })
+        rows.sort(key=lambda row: row["display_name"].lower())
+        with self.collector_lock:
+            templates = [
+                dict(row) for row in self.auth_templates.values()
+                if now - float(row.get("seen", 0.0) or 0.0) <= 900.0
+            ]
+            self.api_refresh_remaining = rows
+            self.api_refresh_total = len(rows)
+            self.api_refresh_started = now
+            self.api_refresh_mode = bool(rows and templates)
+        with self.state.lock:
+            if not rows:
+                self.state.table_scan_status = "API TOPLA: kayıtlı masa bankası yok"
+            elif not templates:
+                self.state.table_scan_status = (
+                    "API TOPLA: yetkili Pragmatic API şablonu yok • önce bir masa aç"
+                )
+            else:
+                self.state.table_scan_status = (
+                    f"API TOPLA: {len(rows)} kayıtlı masa kuyruğa alındı"
+                )
+        self._collector_tick()
+        return True
+
     def _collector_tick(self):
         now = time.time()
         with self.collector_lock:
@@ -8358,15 +8414,57 @@ class ChromeBridge(threading.Thread):
                 if now - float(row.get("seen", 0.0) or 0.0) <= 900.0
             ]
             candidates = [dict(row) for row in self.collector_seen.values()]
+            api_mode = bool(getattr(self, "api_refresh_mode", False))
+            api_remaining = list(getattr(self, "api_refresh_remaining", []) or [])
+            api_total = int(getattr(self, "api_refresh_total", 0) or 0)
         if not templates:
             return
         templates.sort(key=lambda row: float(row.get("seen", 0.0) or 0.0), reverse=True)
         template = templates[0]
-        candidates.sort(key=lambda row: float(row.get("last_requested", 0.0) or 0.0))
         with self.collector_lock:
             available = COLLECTOR_MAX_CONCURRENT - len(self.collector_inflight)
         if available <= 0:
             return
+
+        if api_mode:
+            dispatched = 0
+            kept = []
+            for row in api_remaining:
+                if available <= 0:
+                    kept.append(row)
+                    continue
+                if self._start_background_history_request(
+                    template,
+                    row.get("table_id", ""),
+                    row.get("display_name", ""),
+                    force=True,
+                ):
+                    available -= 1
+                    dispatched += 1
+                else:
+                    # If already inflight, keep it out of the immediate queue;
+                    # the API refresh will continue on the next tick.
+                    kept.append(row)
+            with self.collector_lock:
+                self.api_refresh_remaining = kept
+                remaining = len(self.api_refresh_remaining)
+                inflight = len(self.collector_inflight)
+                if remaining == 0 and inflight == 0:
+                    self.api_refresh_mode = False
+            done = max(0, api_total - remaining)
+            with self.state.lock:
+                if remaining == 0 and inflight == 0:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: tamamlandı • {done}/{api_total} masa denendi"
+                    )
+                else:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: {done}/{api_total} gönderildi • "
+                        f"{inflight} aktif • {remaining} bekliyor"
+                    )
+            return
+
+        candidates.sort(key=lambda row: float(row.get("last_requested", 0.0) or 0.0))
         for row in candidates:
             if available <= 0:
                 break
@@ -9242,7 +9340,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.18 • Data Wait Click Scan")
+        self.root.title("Roulette Pro AI V2.9.19 • API Bank Refresh")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -9413,7 +9511,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.18 DATA SCAN",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.19 API REFRESH",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -9654,6 +9752,14 @@ class App:
             activebackground=self.PANEL2,activeforeground=self.RED,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
         ).pack(side="left",fill="x",expand=True,padx=(2,0))
+        api_bar=tk.Frame(data,bg=self.PANEL)
+        api_bar.pack(fill="x",padx=8,pady=(0,5))
+        tk.Button(
+            api_bar,text="KAYITLI MASALARI API'DEN YENİLE",command=self.start_api_refresh_ui,
+            font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.YELLOW,
+            activebackground=self.PANEL2,activeforeground=self.GREEN,
+            relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
+        ).pack(fill="x",expand=True)
         self.history_brain_line=tk.Label(data,text="Geçmiş sinyali bekleniyor...",font=("Consolas",8),justify="left",anchor="w",fg=self.TEXT,bg=self.PANEL,wraplength=380)
         self.history_brain_line.pack(fill="x",padx=8,pady=(0,6))
 
@@ -10534,6 +10640,9 @@ class App:
 
     def stop_table_scan_ui(self):
         self.bridge.stop_table_scan("kullanıcı durdurdu")
+
+    def start_api_refresh_ui(self):
+        self.bridge.start_api_refresh_all()
 
     def reset_lobby_teach_ui(self):
         self.bridge.reset_lobby_teaching()
