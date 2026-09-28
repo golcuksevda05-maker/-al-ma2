@@ -1,5 +1,6 @@
 import base64
 import html as html_lib
+import hashlib
 import json
 import math
 import os
@@ -29,17 +30,18 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.32: robust visible/network SON500 collector.
-# Single-tab collector no longer closes child/OOPIF targets on timeout; it
-# returns the root collector tab to lobby and reads visible SON 500 through
-# deep DOM/shadow/iframe scans plus generic network history responses.
+# V2.9.33: single-tab collector waits on the real SON500 panel.
+# It does not accept instant/weak lobby responses as success; it reads the
+# bottom-right SON 500 grid above Automatic Play, waits a minimum dwell time,
+# saves that table, then returns to lobby for the next table.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
 COLLECTOR_CARD_CLICK_SECONDS = 10.0
 TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
 TAB_WALK_REFRESH_SECONDS = 300.0
-TAB_WALK_TABLE_TIMEOUT_SECONDS = 90.0
+TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
+TAB_WALK_TABLE_MIN_DWELL_SECONDS = 12.0
 DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
 DGA_DEFAULT_CURRENCY = "TRY"
@@ -6512,6 +6514,78 @@ HISTORY500_SCAN = r"""
   }
 
   let roots = [];
+
+  // V2.9.33: targeted read of the exact place the user pointed to:
+  // the SON 500 grid in the lower-right panel, directly above the
+  // "OTOMATIK OYUN / AUTOMATIC PLAY" button. This avoids grabbing lobby
+  // text, racetrack chips, or table cards.
+  const autoButtons = deepQueryAll(document, 'button,[role="button"],div,span,a')
+    .filter(el => visibleStyle(el) && /OTOMAT[İI]K\s*OYUN|AUTOMATIC\s*(PLAY|GAME)|AUTO\s*PLAY/.test(norm(readableText(el))));
+  const autoFound = autoButtons.length > 0;
+  function numsInRect(rect) {
+    const recs = [];
+    const seenEls = new Set();
+    for (const el of deepQueryAll(document, '*')) {
+      if (!visibleStyle(el) || seenEls.has(el)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
+      let childNumeric = false;
+      try {
+        for (const ch of el.children || []) {
+          if (numericValue(ch) !== null) { childNumeric = true; break; }
+        }
+      } catch (_) {}
+      if (childNumeric) continue;
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      if (cx < rect.left || cx > rect.right || cy < rect.top || cy > rect.bottom) continue;
+      const txt = norm(readableText(parentOf(el) || el));
+      if (/BAKIYE|BALANCE|TOPLAM\s*BAHIS|TOTAL\s*BET|BAHIS|BET|JETON|CHIP|VOISINS|ORPHELINS|TIERS|KOMŞU|KOMSU/.test(txt)) continue;
+      seenEls.add(el);
+      recs.push({n, x:cx, y:cy});
+    }
+    recs.sort((a,b) => Math.round(a.y/8)-Math.round(b.y/8) || a.x-b.x);
+    return recs.map(r => r.n);
+  }
+  const panelRects = [];
+  for (const btn of autoButtons.slice(0,4)) {
+    try {
+      const r = btn.getBoundingClientRect();
+      if (r.width < 40 || r.height < 15) continue;
+      panelRects.push({
+        left: Math.max(0, r.left - 430),
+        top: Math.max(0, r.top - 390),
+        right: Math.min(innerWidth, r.right + 60),
+        bottom: Math.max(0, r.top - 2),
+        source: 'auto-button'
+      });
+    } catch (_) {}
+  }
+  if (tab) {
+    try {
+      const tr = tab.getBoundingClientRect();
+      let bottom = innerHeight * 0.97;
+      if (autoButtons.length) {
+        const ar = autoButtons[0].getBoundingClientRect();
+        bottom = Math.max(tr.bottom + 20, ar.top - 2);
+      }
+      panelRects.push({
+        left: Math.max(0, tr.left - 320),
+        top: Math.max(0, tr.bottom - 4),
+        right: Math.min(innerWidth, tr.right + 120),
+        bottom,
+        source: 'son500-tab'
+      });
+    } catch (_) {}
+  }
+  for (const rect of panelRects) {
+    const nums = numsInRect(rect);
+    if (nums.length >= 20 && nums.length <= 650) {
+      roots.push({root:document.body, nums, count:nums.length, depth:1, score:900 + nums.length, source:rect.source});
+    }
+  }
+
   if (tab) {
     let r = tab;
     for (let depth = 0; depth < 12 && r; depth++, r = parentOf(r)) {
@@ -6632,6 +6706,8 @@ HISTORY500_SCAN = r"""
     url: location.href,
     expandedDrawer,
     foundTab: !!tab,
+    autoFound,
+    source: best ? (best.source || '') : '',
     count: best ? best.nums.length : 0,
     nums: best ? best.nums.slice(0, 500) : []
   };
@@ -6962,6 +7038,7 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
         next.hit.scrollIntoView({{block:'center', inline:'center'}});
       }} catch (_) {{}}
       try {{
+        try {{ performance.clearResourceTimings(); }} catch (_) {{}}
         next.hit.click();
         return {{
           ok:true,
@@ -7664,6 +7741,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probed_keys = set()
         self.table_scan_clicked_keys = set()
         self.table_scan_click_deadlines = {}
+        self.table_scan_click_started_at = {}
         self.table_scan_current_click_key = ""
         self.table_scan_current_click_label = ""
         self.table_scan_last_clicked_label = ""
@@ -8363,6 +8441,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_success = set()
         self.table_scan_probe_fail = set()
         self.table_scan_click_deadlines = {}
+        self.table_scan_click_started_at = {}
         if self.ws is not None:
             for tid in tids:
                 try:
@@ -8384,6 +8463,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probed_keys = set()
         self.table_scan_clicked_keys = set()
         self.table_scan_click_deadlines = {}
+        self.table_scan_click_started_at = {}
         self.table_scan_probe_done = set()
         self.table_scan_probe_success = set()
         self.table_scan_probe_fail = set()
@@ -8424,12 +8504,12 @@ class ChromeBridge(threading.Thread):
         )
 
     def start_tab_walk_scan(self, auto_cycle=True):
-        """Open roulette lobby and collect tables via one tab per table.
+        """Open roulette lobby and collect tables in one side tab.
 
-        This is the user's requested fallback for operators where API/DGA does
-        not move: keep the lobby page, open a table in a separate Chrome tab,
-        wait for SON500/statisticHistory, close it, then immediately open the
-        next queued table. A completed pass repeats every 5 minutes.
+        The user keeps playing in their own tab. This collector tab enters the
+        Pragmatic lobby, clicks one real table card, waits on the lower-right
+        SON 500 panel above Automatic Play, saves it, returns to lobby, then
+        clicks the next table. A completed pass repeats every 5 minutes.
         """
         self._close_table_scan_target()
         self.chrome_dga_enabled = False
@@ -8493,9 +8573,60 @@ class ChromeBridge(threading.Thread):
                 self.state.table_scan_status = f"MASA TARAMA/API ÖĞREN: durdu • {reason}"
         return True
 
+    def _clean_collector_label(self, text, fallback="Roulette"):
+        label = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not label:
+            return fallback
+        nums = re.findall(r"\b(?:[0-9]|[12][0-9]|3[0-6])\b", label)
+        upper = label.upper()
+        if len(nums) >= 8:
+            m = re.search(
+                r"([A-ZÇĞİÖŞÜ0-9 ._-]{0,28}(?:ROULETTE|RULET)[A-ZÇĞİÖŞÜ0-9 ._-]{0,28})",
+                upper,
+                flags=re.I,
+            )
+            if m:
+                label = m.group(1).strip(" -_•|")
+            else:
+                label = fallback
+        return label[:80] or fallback
+
+    def _collector_table_identity(self, sid="", real_table_id="", title=""):
+        real = str(real_table_id or "").strip()
+        raw_label = str(
+            title
+            or self.table_scan_current_click_label
+            or self.table_scan_last_clicked_label
+            or real
+            or "Roulette"
+        ).strip()
+        label = self._clean_collector_label(raw_label, fallback=real or "Roulette")
+        if real:
+            return real, (label or real)
+        raw = str(self.table_scan_current_click_key or raw_label or sid or "collector")
+        digest = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:12]
+        return f"collector_{digest}", (label or f"Roulette {digest}")
+
     def _schedule_collector_return(self, sid, delay=0.8):
-        due = time.time() + float(delay or 0.8)
+        now = time.time()
+        delay = float(delay or 0.8)
         sid = str(sid or "")
+        if self.table_scan_tab_walk:
+            started = 0.0
+            if sid:
+                started = float(self.table_scan_click_started_at.get(sid, 0.0) or 0.0)
+            if not started:
+                for v in self.table_scan_click_started_at.values():
+                    try:
+                        started = max(started, float(v or 0.0))
+                    except Exception:
+                        pass
+            if started:
+                delay = max(
+                    delay,
+                    max(0.8, TAB_WALK_TABLE_MIN_DWELL_SECONDS - (now - started)),
+                )
+        due = now + delay
         if sid:
             self.table_scan_click_deadlines[sid] = due
         if self.table_scan_tab_walk:
@@ -8506,15 +8637,17 @@ class ChromeBridge(threading.Thread):
                 if scan_sid == sid or scan_sid == root_sid or scan_sid in self.table_scan_click_deadlines:
                     old = float(self.table_scan_click_deadlines.get(scan_sid, 0.0) or 0.0)
                     self.table_scan_click_deadlines[scan_sid] = min(old, due) if old else due
+                    self.table_scan_click_started_at.setdefault(scan_sid, (started or now) if self.table_scan_tab_walk else now)
         return due
 
-    def _return_collector_to_lobby(self, sid, reason="sıradaki masa"):
+    def _return_collector_to_lobby(self, sid, reason="sıradaki masa"): 
         if not sid or self.ws is None:
             return False
         url = str(self.table_scan_entry_url or self._collector_launch_url() or "")
         if not url:
             return False
         self.table_scan_click_deadlines.pop(sid, None)
+        self.table_scan_click_started_at.pop(sid, None)
         tid = self._target_id_for_session(sid)
         root = str(self.table_scan_target_id or "")
         try:
@@ -8526,6 +8659,7 @@ class ChromeBridge(threading.Thread):
                 for scan_sid in list(self.table_scan_click_deadlines.keys()):
                     if self._is_collector_session(scan_sid):
                         self.table_scan_click_deadlines.pop(scan_sid, None)
+                        self.table_scan_click_started_at.pop(scan_sid, None)
                 root_sid = self._collector_root_session() or sid
                 lobby_json = json.dumps(url)
                 back_js = (
@@ -9157,11 +9291,19 @@ class ChromeBridge(threading.Thread):
                 else COLLECTOR_CARD_CLICK_SECONDS
             )
             self.table_scan_click_deadlines[sid] = now + wait_seconds
+            self.table_scan_click_started_at = {sid: now}
+            # Clear stale table activity from the previous table; otherwise a
+            # cached statisticHistory/resource entry can be mistaken for the
+            # newly clicked table and make the collector return immediately.
+            for scan_sid in list(self.session_info.keys()):
+                if self._is_collector_session(scan_sid):
+                    self.session_table_activity.pop(scan_sid, None)
+            clean_clicked_label = self._clean_collector_label(clicked_label, fallback="veri bekleniyor")
             with self.state.lock:
                 self.state.table_scan_status = (
                     f"{prefix}: masa kartı tıklandı • "
-                    + (clicked_label[:60] if clicked_label else "veri bekleniyor")
-                    + " • SON500/statisticHistory bekleniyor"
+                    + (clean_clicked_label[:60] if clean_clicked_label else "veri bekleniyor")
+                    + " • sağ-alt SON500 paneli bekleniyor"
                 )
             return
 
@@ -9511,6 +9653,9 @@ class ChromeBridge(threading.Thread):
                 else 8.0
             )
             self.table_scan_click_deadlines[sid] = now + wait_seconds
+            if self.table_scan_tab_walk:
+                started = max([float(x or 0.0) for x in self.table_scan_click_started_at.values()] or [0.0])
+                self.table_scan_click_started_at.setdefault(sid, started or now)
             with self.state.lock:
                 prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                 self.state.table_scan_status = (
@@ -9861,8 +10006,17 @@ class ChromeBridge(threading.Thread):
                         # Preserve order while removing duplicate context ids.
                         scan_contexts = list(dict.fromkeys(scan_contexts))
                         for context_id in scan_contexts:
+                            wait_started = max(
+                                [float(x or 0.0) for x in self.table_scan_click_started_at.values()] or [0.0]
+                            )
+                            skip_runtime_direct = bool(
+                                self.table_scan_tab_walk
+                                and self.table_scan_click_deadlines
+                                and wait_started
+                                and now - wait_started < 8.0
+                            )
                             direct_key = (sid, context_id, "collector_direct")
-                            if now - float(last_direct_scan.get(direct_key, 0.0)) >= 2.0:
+                            if (not skip_runtime_direct) and now - float(last_direct_scan.get(direct_key, 0.0)) >= 2.0:
                                 last_direct_scan[direct_key] = now
                                 direct_params = {
                                     "expression": DIRECT_HISTORY_SCAN,
@@ -9884,22 +10038,24 @@ class ChromeBridge(threading.Thread):
                                     },
                                 )
 
-                            # V2.9.32: in single-tab collector mode also read
-                            # the visible SON 500 grid from the opened table.
-                            # Run this even before tableId is known: the clicked
-                            # lobby-card key is enough to store the bank entry,
-                            # and a later real tableId will overwrite the name.
+                            # V2.9.33: in single-tab mode read visible SON 500
+                            # only while a clicked table is actually being
+                            # waited on. Do not keep scanning stale tableId after
+                            # returning to the lobby; that caused confusing
+                            # 'bulunan 0' statuses in the lobby.
                             collector_tid = str(
                                 (self.session_table_activity.get(sid, {}) or {}).get("table_id", "")
                                 or ""
                             )
-                            fallback_tid = str(
-                                collector_tid
-                                or self.table_scan_current_click_key
-                                or self.table_scan_last_clicked_label
-                                or sid
-                            )[:180]
-                            if self.table_scan_tab_walk and (self.table_scan_click_deadlines or collector_tid):
+                            fallback_tid, fallback_title = self._collector_table_identity(
+                                sid,
+                                real_table_id=collector_tid,
+                                title=str(
+                                    self.session_info.get(sid, {}).get("title", "")
+                                    or self.table_scan_current_click_label
+                                ),
+                            )
+                            if self.table_scan_tab_walk and self.table_scan_click_deadlines:
                                 hist_key = (sid, context_id, "collector_history500")
                                 if now - float(last_500_scan.get(hist_key, 0.0)) >= 1.8:
                                     last_500_scan[hist_key] = now
@@ -9919,10 +10075,7 @@ class ChromeBridge(threading.Thread):
                                             "session": sid,
                                             "table_id": fallback_tid,
                                             "real_table_id": collector_tid,
-                                            "title": str(
-                                                self.session_info.get(sid, {}).get("title", "")
-                                                or self.table_scan_current_click_label
-                                            ),
+                                            "title": fallback_title,
                                             "collector": True,
                                         },
                                     )
@@ -10114,10 +10267,13 @@ class ChromeBridge(threading.Thread):
                 if self.table_scan_enabled and tid in self.table_scan_found_ids:
                     now_done = time.time()
                     for scan_sid in list(self.table_scan_click_deadlines.keys()):
-                        self.table_scan_click_deadlines[scan_sid] = min(
-                            float(self.table_scan_click_deadlines.get(scan_sid, now_done + 1.0) or 0.0),
-                            now_done + 1.0,
-                        )
+                        if self.table_scan_tab_walk:
+                            self._schedule_collector_return(scan_sid, 0.8)
+                        else:
+                            self.table_scan_click_deadlines[scan_sid] = min(
+                                float(self.table_scan_click_deadlines.get(scan_sid, now_done + 1.0) or 0.0),
+                                now_done + 1.0,
+                            )
                     for probe_tid, probe_row in list(self.table_scan_probe_targets.items()):
                         if str(probe_row.get("table_id_seen") or probe_row.get("table_id") or "") == tid:
                             probe_row["done_at"] = now_done
@@ -10127,7 +10283,9 @@ class ChromeBridge(threading.Thread):
                     with self.state.lock:
                         prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                         self.state.table_scan_status = (
-                            f"{prefix}: veri alındı • {tid} • sıradaki masaya geçiliyor"
+                            f"{prefix}: API SON500 kaydedildi • {str(display_name or tid)[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
+                            if self.table_scan_tab_walk
+                            else f"{prefix}: veri alındı • {tid} • sıradaki masaya geçiliyor"
                         )
             except Exception as exc:
                 if self.api_refresh_mode:
@@ -10530,10 +10688,14 @@ class ChromeBridge(threading.Thread):
                 if table_id:
                     self.table_scan_found_ids.add(table_id)
                 if table_id and len(nums) >= 20:
+                    display_name = self._clean_collector_label(
+                        str(meta.get("title") or self.table_scan_last_clicked_label or table_id),
+                        fallback=table_id,
+                    )
                     self.state.store_background_table_history(
                         nums,
                         table_id=table_id,
-                        display_name=str(meta.get("title") or self.table_scan_last_clicked_label or table_id),
+                        display_name=display_name,
                         source_label="SEKMELİ TOPLA statisticHistory network",
                     )
                     self.state.mark_table_attempt(table_id, ok=True)
@@ -10552,7 +10714,7 @@ class ChromeBridge(threading.Thread):
                     with self.state.lock:
                         prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                         self.state.table_scan_status = (
-                            f"{prefix}: NETWORK veri alındı • {table_id} • lobiye dönülüyor"
+                            f"{prefix}: NETWORK SON500 kaydedildi • {display_name[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
                         )
                 elif table_id and self.table_scan_tab_walk:
                     with self.state.lock:
@@ -10621,7 +10783,7 @@ class ChromeBridge(threading.Thread):
                         with self.state.lock:
                             prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                             self.state.table_scan_status = (
-                                f"{prefix}: veri alındı • {table_id} • sıradaki masaya geçiliyor"
+                                f"{prefix}: runtime SON500 kaydedildi • {(title or self.table_scan_last_clicked_label or table_id)[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
                             )
                     elif table_id:
                         # tableId arrived but usable SON500/statisticHistory has not
@@ -10720,46 +10882,54 @@ class ChromeBridge(threading.Thread):
                     source=source_label[:140],
                 )
 
-            # V2.9.32: while the single-tab collector is inside a real table,
-            # any JSON/text game response may contain the same history payload
-            # even when the URL is not exactly /api/ui/statisticHistory. Try a
-            # generic SON500 extraction before treating collector traffic as
-            # discovery-only.
+            # V2.9.33: while the single-tab collector is inside a real table,
+            # accept generic network history only from history/stat/result-like
+            # endpoints. Do not treat lobby/game-list JSON as a table success;
+            # that made the tab leave the table too quickly.
             collector_sid = str(meta.get("session") or "")
             if self._is_collector_session(collector_sid):
                 if self.table_scan_tab_walk and self.table_scan_click_deadlines:
-                    nums = extract_statistic_history(body)
-                    if len(nums) >= 20:
-                        source_url = str(meta.get("url") or "")
-                        try:
-                            u = urllib.parse.urlsplit(source_url)
-                            qs = urllib.parse.parse_qs(u.query)
-                            table_id = str((qs.get("tableId") or [""])[0] or "")
-                        except Exception:
-                            table_id = ""
-                        if not table_id:
-                            table_id = str(
-                                (self.session_table_activity.get(collector_sid, {}) or {}).get("table_id", "")
-                                or self.table_scan_current_click_key
-                                or self.table_scan_last_clicked_label
-                                or collector_sid
-                            )[:180]
-                        self.state.store_background_table_history(
-                            nums,
-                            table_id=table_id,
-                            display_name=str(self.table_scan_last_clicked_label or table_id),
-                            source_label="SEKMELİ TOPLA genel network SON500",
-                        )
-                        self.state.mark_table_attempt(table_id, ok=True)
-                        now_done = time.time()
-                        self._schedule_collector_return(collector_sid, 0.8)
-                        key = str(self.table_scan_current_click_key or table_id)
-                        self.table_scan_probe_done.add(key)
-                        self.table_scan_probe_success.add(key)
-                        with self.state.lock:
-                            self.state.table_scan_status = (
-                                f"SEKMELİ TOPLA: genel network SON500 alındı • {table_id} • {len(nums)}/500 • lobiye dönülüyor"
+                    source_url = str(meta.get("url") or "")
+                    low_url = source_url.lower()
+                    historyish = any(x in low_url for x in (
+                        "statistic", "history", "recent", "result", "round",
+                        "shoe", "roadmap", "statistics"
+                    ))
+                    if historyish:
+                        nums = extract_statistic_history(body)
+                        if len(nums) >= 20:
+                            try:
+                                u = urllib.parse.urlsplit(source_url)
+                                qs = urllib.parse.parse_qs(u.query)
+                                real_tid = str((qs.get("tableId") or [""])[0] or "")
+                            except Exception:
+                                real_tid = ""
+                            if not real_tid:
+                                real_tid = str(
+                                    (self.session_table_activity.get(collector_sid, {}) or {}).get("table_id", "")
+                                    or ""
+                                )
+                            table_id, display_name = self._collector_table_identity(
+                                collector_sid,
+                                real_table_id=real_tid,
+                                title=str(self.table_scan_last_clicked_label or ""),
                             )
+                            self.state.store_background_table_history(
+                                nums,
+                                table_id=table_id,
+                                display_name=display_name,
+                                source_label="SEKMELİ TOPLA genel network SON500",
+                            )
+                            self.state.mark_table_attempt(table_id, ok=True)
+                            now_done = time.time()
+                            self._schedule_collector_return(collector_sid, 0.8)
+                            key = str(self.table_scan_current_click_key or table_id)
+                            self.table_scan_probe_done.add(key)
+                            self.table_scan_probe_success.add(key)
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: genel network SON500 kaydedildi • {display_name[:44]} • {len(nums)}/500 • panel bekleme tamamlanınca lobiye dönülecek"
+                                )
                 return
 
             if "last20Results" not in body:
@@ -11018,21 +11188,32 @@ class ChromeBridge(threading.Thread):
                             value.get("title","")
                             or meta.get("title","")
                         )
-                        table_id = str(meta.get("table_id","") or "")
-                        if len(nums) >= 20 and table_id:
+                        raw_table_id = str(meta.get("table_id","") or "")
+                        is_collector = bool(meta.get("collector"))
+                        panel_seen = bool(
+                            value.get("autoFound")
+                            or value.get("foundTab")
+                            or str(value.get("source") or "") in ("auto-button", "son500-tab")
+                        )
+                        table_id, display_name = self._collector_table_identity(
+                            str(meta.get("session") or ""),
+                            real_table_id=str(meta.get("real_table_id") or raw_table_id),
+                            title=title,
+                        ) if is_collector else (raw_table_id, title)
+                        if len(nums) >= 20 and table_id and ((not is_collector) or panel_seen):
                             source_label = (
-                                "SEKMELİ TOPLA görünür SON500"
-                                if bool(meta.get("collector"))
+                                "SEKMELİ TOPLA sağ-alt SON500 paneli"
+                                if is_collector
                                 else "ARKA PLAN SON500"
                             )
                             self.state.store_background_table_history(
                                 nums,
                                 table_id=table_id,
-                                display_name=title,
+                                display_name=display_name,
                                 source_label=source_label,
                             )
                             self.state.mark_table_attempt(table_id, ok=True)
-                            if bool(meta.get("collector")):
+                            if is_collector:
                                 sid_ctx = str(meta.get("session") or "")
                                 now_done = time.time()
                                 if sid_ctx:
@@ -11042,12 +11223,13 @@ class ChromeBridge(threading.Thread):
                                 self.table_scan_probe_success.add(key)
                                 with self.state.lock:
                                     self.state.table_scan_status = (
-                                        f"SEKMELİ TOPLA: görünür SON500 alındı • {table_id} • {len(nums)}/500 • lobiye dönülüyor"
+                                        f"SEKMELİ TOPLA: sağ-alt SON500 paneli kaydedildi • {display_name[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
                                     )
-                        elif bool(meta.get("collector")) and table_id:
+                        elif is_collector and table_id:
                             with self.state.lock:
+                                panel_text = "panel görüldü" if panel_seen else "masa paneli bekleniyor"
                                 self.state.table_scan_status = (
-                                    f"SEKMELİ TOPLA: görünür SON500 bekleniyor • {table_id} • bulunan {len(nums)}"
+                                    f"SEKMELİ TOPLA: sağ-alt SON500 okunuyor • {display_name[:44]} • {panel_text} • bulunan {len(nums)}"
                                 )
                 except Exception:
                     pass
@@ -11506,7 +11688,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.32 • SON500 Sabit Bekle")
+        self.root.title("Roulette Pro AI V2.9.33 • SON500 Panel Bekle")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -11677,7 +11859,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.32 SON500 BEKLE",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.33 SON500 PANEL",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

@@ -1,0 +1,26 @@
+ROULETTE PRO AI V2.9.33 SON500 PANEL BEKLE KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.33 SON500 PANEL yazmalı.
+
+KULLANIM
+1. Kendi oyun sekmen açık kalabilir.
+2. Programda VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+3. Program tek yan sekmede Pragmatic Play Lobby'ye girer.
+4. Rulet masa kartını gerçek tıklama ile açar.
+5. Masa açılınca sağ alt köşede OTOMATİK OYUN yazısının üstündeki SON 500 panelini okur.
+6. En az 20 sayı yakalarsa masa bankasına kaydeder.
+7. Minimum 12 saniye bekledikten sonra lobiye döner ve sıradaki masaya geçer.
+8. Tüm tur bitince 5 dakika sonra tekrar eder ve yeni gelen spinleri arşive ekler.
+
+ÖNEMLİ
+- Bu sürüm 'masaya giriyor ama girdiği gibi çıkıyor' sorununu azaltmak için yapıldı.
+- Lobi kartlarındaki sayılar başarı sayılmaz; sağ-alt masa SON500 paneli hedeflenir.
