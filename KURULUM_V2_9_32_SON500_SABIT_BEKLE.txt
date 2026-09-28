@@ -1,0 +1,23 @@
+ROULETTE PRO AI V2.9.32 SON500 SABİT BEKLE KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.32 SON500 BEKLE yazmalı.
+
+KULLANIM
+1. Kendi oyun sekmen açık kalabilir.
+2. Programda VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+3. Collector tek yan sekmede lobiye girer, masa kartlarına tek tek gerçek tıklama yapar.
+4. Masa açılınca 90 saniyeye kadar SON500/statisticHistory/görünen panel verisi bekler.
+5. Veri gelirse bankaya kaydeder ve lobiye döner.
+6. Veri gelmezse sekmeyi kapatmadan lobiye döner ve sıradaki masaya geçer.
+
+ÖNEMLİ
+- Bu sürüm özellikle 'SON 500 ekranda görünüyor ama program okuyamıyor / zaman aşımıyla kapatıyor' durumu için yapıldı.

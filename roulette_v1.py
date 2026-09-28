@@ -29,17 +29,17 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.31: visible SON500 DOM collector.
-# When statisticHistory response schema cannot be parsed, the collector now
-# reads the visible SON 500 panel/grid from the actual opened table DOM before
-# leaving the table.
+# V2.9.32: robust visible/network SON500 collector.
+# Single-tab collector no longer closes child/OOPIF targets on timeout; it
+# returns the root collector tab to lobby and reads visible SON 500 through
+# deep DOM/shadow/iframe scans plus generic network history responses.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
 COLLECTOR_CARD_CLICK_SECONDS = 10.0
 TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
 TAB_WALK_REFRESH_SECONDS = 300.0
-TAB_WALK_TABLE_TIMEOUT_SECONDS = 55.0
+TAB_WALK_TABLE_TIMEOUT_SECONDS = 90.0
 DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
 DGA_DEFAULT_CURRENCY = "TRY"
@@ -2950,6 +2950,11 @@ DIRECT_RESULT_KEYS = (
     "resultNumber", "result_number",
     "rouletteNumber", "roulette_number",
     "winningPocket", "winning_pocket",
+    "gameResult", "game_result",
+    "spinResult", "spin_result",
+    "outcomeNumber", "outcome_number",
+    "resultValue", "result_value",
+    "slotNumber", "slot_number",
 )
 
 def _roulette_num(value):
@@ -2965,6 +2970,21 @@ def _roulette_num(value):
             return int(s)
     return None
 
+
+def _roulette_num_loose(value):
+    n = _roulette_num(value)
+    if n is not None:
+        return n
+    if isinstance(value, str):
+        s = value.strip()
+        # For named result fields Pragmatic may return strings like "29 BLACK"
+        # or "Winning number: 29". Accept a single roulette number token only.
+        nums = re.findall(r"(?<!\d)(?:[0-9]|[12][0-9]|3[0-6])(?!\d)", s)
+        if len(nums) == 1:
+            return int(nums[0])
+    return None
+
+
 def _find_result_in_record(record, depth=0):
     if depth > 6:
         return None
@@ -2972,7 +2992,7 @@ def _find_result_in_record(record, depth=0):
         lower={str(k).lower():v for k,v in record.items()}
         for wanted in DIRECT_RESULT_KEYS:
             v=lower.get(wanted.lower())
-            n=_roulette_num(v)
+            n=_roulette_num_loose(v)
             if n is not None:
                 return n
             if isinstance(v,(dict,list)):
@@ -3045,6 +3065,11 @@ def extract_statistic_history(body):
             good=[n for n in primitive if n is not None]
             if len(node)>=20 and len(good)>=max(20,int(len(node)*0.80)):
                 add(good,path,35)
+            elif len(node)>=20:
+                loose=[_roulette_num_loose(v) for v in node]
+                loose_good=[n for n in loose if n is not None]
+                if len(loose_good)>=max(20,int(len(node)*0.80)):
+                    add(loose_good,path,25)
             dict_count=sum(isinstance(v,dict) for v in node)
             if len(node)>=20 and dict_count>=int(len(node)*0.60):
                 vals=[]
@@ -6331,52 +6356,116 @@ HISTORY500_SCAN = r"""
 
   function visibleStyle(el) {
     try {
-      const s = getComputedStyle(el);
-      return s.display !== "none" && s.visibility !== "hidden";
+      const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+      const s = win.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return r.width > 1 && r.height > 1 &&
+             s.display !== "none" && s.visibility !== "hidden" &&
+             Number(s.opacity || 1) !== 0;
     } catch (_) {
       return false;
     }
+  }
+
+  function deepQueryAll(root, selector) {
+    const out = [];
+    const seenRoots = new Set();
+    const pushUnique = el => {
+      if (el && !out.includes(el)) out.push(el);
+    };
+    function visit(r) {
+      if (!r || seenRoots.has(r)) return;
+      seenRoots.add(r);
+      let nodes = [];
+      try { nodes = Array.from(r.querySelectorAll(selector)); } catch (_) { nodes = []; }
+      for (const n of nodes) pushUnique(n);
+      let all = [];
+      try { all = Array.from(r.querySelectorAll('*')); } catch (_) { all = []; }
+      for (const el of all) {
+        try { if (el.shadowRoot) visit(el.shadowRoot); } catch (_) {}
+        try {
+          if (String(el.tagName || '').toUpperCase() === 'IFRAME' && el.contentDocument) {
+            visit(el.contentDocument);
+          }
+        } catch (_) {}
+      }
+    }
+    visit(root);
+    return out;
+  }
+
+  function ownTexts(el) {
+    const vals = [];
+    try { vals.push(el.innerText || ''); } catch (_) {}
+    try { vals.push(el.textContent || ''); } catch (_) {}
+    for (const a of ['aria-label','title','data-value','data-number','data-result','data-role','value']) {
+      try { vals.push(el.getAttribute(a) || ''); } catch (_) {}
+    }
+    return vals;
+  }
+
+  function numericValue(el) {
+    for (const raw of ownTexts(el)) {
+      const t = norm(raw);
+      if (numRe.test(t)) return Number(t);
+    }
+    return null;
+  }
+
+  function readableText(el) {
+    try { return el.innerText || el.textContent || ''; } catch (_) { return ''; }
+  }
+
+  function parentOf(el) {
+    if (!el) return null;
+    if (el.parentElement) return el.parentElement;
+    try {
+      const root = el.getRootNode && el.getRootNode();
+      if (root && root.host) return root.host;
+    } catch (_) {}
+    return null;
   }
 
   function numericLeaves(root) {
     const out = [];
     if (!root) return out;
 
-    for (const el of root.querySelectorAll("*")) {
+    for (const el of deepQueryAll(root, "*")) {
       if (!visibleStyle(el)) continue;
-
-      const t = norm(el.textContent);
-      if (!numRe.test(t)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
 
       // Avoid counting both a wrapper and its numeric child.
       let childHasSameNumeric = false;
-      for (const ch of el.children) {
-        if (numRe.test(norm(ch.textContent))) {
-          childHasSameNumeric = true;
-          break;
+      try {
+        for (const ch of el.children || []) {
+          const cn = numericValue(ch);
+          if (cn !== null) {
+            childHasSameNumeric = true;
+            break;
+          }
         }
-      }
+      } catch (_) {}
       if (childHasSameNumeric) continue;
 
-      const n = Number(t);
-      if (n >= 0 && n <= 36) out.push(n);
+      out.push(n);
     }
     return out;
   }
 
-  let all = Array.from(document.querySelectorAll(
-    'button,[role="tab"],[role="button"],div,span'
-  ));
+  let all = deepQueryAll(document,
+    'button,[role="tab"],[role="button"],div,span,a'
+  );
 
   function findHistoryTab() {
     let found = all.find(el => {
-      const t = norm(el.innerText || el.textContent);
+      const t = norm(readableText(el));
       return (t === "SON 500" || t === "LAST 500") && visibleStyle(el);
     });
     if (found) return found;
     return all.find(el => {
-      const t = norm(el.innerText || el.textContent);
-      return /\b(?:SON|LAST)\s*500\b/.test(t) && t.length <= 20 && visibleStyle(el);
+      const t = norm(readableText(el));
+      return /\b(?:SON|LAST)\s*500\b/.test(t) && t.length <= 28 && visibleStyle(el);
     });
   }
 
@@ -6384,12 +6473,12 @@ HISTORY500_SCAN = r"""
   let expandedDrawer = false;
   if (!tab) {
     const toggles = [];
-    for (const el of document.querySelectorAll('button,[role="button"]')) {
+    for (const el of deepQueryAll(document, 'button,[role="button"],a')) {
       if (!visibleStyle(el)) continue;
       const r = el.getBoundingClientRect();
-      const text = norm(el.innerText || el.textContent);
-      if (r.width < 16 || r.height < 16 || r.width > 90 || r.height > 90) continue;
-      if (r.left < innerWidth * 0.72 || r.top < innerHeight * 0.55 || r.top > innerHeight * 0.93) continue;
+      const text = norm(readableText(el));
+      if (r.width < 12 || r.height < 12 || r.width > 120 || r.height > 120) continue;
+      if (r.left < innerWidth * 0.64 || r.top < innerHeight * 0.45 || r.top > innerHeight * 0.96) continue;
       if (/OTOMAT|AUTOMATIC|BET|BAHİS|SPIN/.test(text)) continue;
       const hint = [
         el.id || '', el.getAttribute('class') || '',
@@ -6397,10 +6486,10 @@ HISTORY500_SCAN = r"""
         el.innerHTML || ''
       ].join(' ').toLowerCase();
       let score = 0;
-      if (/(history|statistic|result|drawer|expand|collapse|chevron|arrow|toggle)/.test(hint)) score += 80;
-      if (text === '' || text === '⌃' || text === '▲' || text === '˄') score += 25;
-      score += Math.max(0, 20 - Math.abs(innerWidth - r.right) / 8);
-      score += Math.max(0, 20 - Math.abs(innerHeight * 0.78 - (r.top + r.height/2)) / 8);
+      if (/(history|statistic|result|drawer|expand|collapse|chevron|arrow|toggle|graph|hot|cold)/.test(hint)) score += 80;
+      if (text === '' || text === '⌃' || text === '▲' || text === '˄' || text === '^') score += 25;
+      score += Math.max(0, 22 - Math.abs(innerWidth - r.right) / 8);
+      score += Math.max(0, 22 - Math.abs(innerHeight * 0.76 - (r.top + r.height/2)) / 8);
       toggles.push({el, score});
     }
     toggles.sort((a,b) => b.score - a.score);
@@ -6408,10 +6497,10 @@ HISTORY500_SCAN = r"""
       try {
         toggles[0].el.click();
         expandedDrawer = true;
-        await sleep(550);
-        all = Array.from(document.querySelectorAll(
-          'button,[role="tab"],[role="button"],div,span'
-        ));
+        await sleep(700);
+        all = deepQueryAll(document,
+          'button,[role="tab"],[role="button"],div,span,a'
+        );
         tab = findHistoryTab();
       } catch (_) {}
     }
@@ -6419,20 +6508,21 @@ HISTORY500_SCAN = r"""
 
   if (tab) {
     try { tab.click(); } catch (_) {}
-    await sleep(350);
+    await sleep(500);
   }
 
   let roots = [];
   if (tab) {
     let r = tab;
-    for (let depth = 0; depth < 9 && r; depth++, r = r.parentElement) {
+    for (let depth = 0; depth < 12 && r; depth++, r = parentOf(r)) {
       const nums = numericLeaves(r);
       if (nums.length >= 20 && nums.length <= 650) {
         roots.push({
           root: r,
           nums,
           count: nums.length,
-          depth
+          depth,
+          score: nums.length * 2 + 150 - depth * 4
         });
       }
     }
@@ -6440,9 +6530,9 @@ HISTORY500_SCAN = r"""
 
   // Fallback: find compact DOM blocks mentioning SON 500.
   if (!roots.length) {
-    for (const el of document.querySelectorAll("div,section,aside")) {
+    for (const el of deepQueryAll(document, "div,section,aside,main")) {
       if (!visibleStyle(el)) continue;
-      const t = norm(el.innerText || "");
+      const t = norm(readableText(el));
       if (!/\b(?:SON|LAST)\s*500\b/.test(t)) continue;
       const nums = numericLeaves(el);
       if (nums.length >= 20 && nums.length <= 650) {
@@ -6451,40 +6541,38 @@ HISTORY500_SCAN = r"""
           nums,
           count: nums.length,
           depth: 99,
-          score: nums.length * 2 + 20
+          score: nums.length * 2 + 80
         });
       }
     }
   }
 
-  // V2.9.31: the user's screen shows SON 500 as a visible grid on the
-  // lower-right game panel. Some builds do not keep the "SON 500" label in
-  // the same DOM block as the numbers. Build dense numeric clusters by layout
-  // and pick the largest non-betting cluster.
+  // V2.9.32: the user's screen shows SON 500 as a visible grid on the
+  // lower-right game panel. Some builds keep the label outside the number
+  // block, inside shadow DOM, or inside a same-origin iframe. Build dense
+  // numeric clusters by layout and pick the largest non-betting cluster.
   if (!roots.length) {
     const records=[];
-    for (const el of document.querySelectorAll('*')) {
+    for (const el of deepQueryAll(document, '*')) {
       if (!visibleStyle(el)) continue;
-      const t=norm(el.innerText || el.textContent || '');
-      if (!numRe.test(t)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
       let childNumeric=false;
-      for (const ch of el.children) {
-        if (numRe.test(norm(ch.innerText || ch.textContent || ''))) {
-          childNumeric=true; break;
+      try {
+        for (const ch of el.children || []) {
+          if (numericValue(ch) !== null) { childNumeric=true; break; }
         }
-      }
+      } catch (_) {}
       if (childNumeric) continue;
       const r=el.getBoundingClientRect();
-      if (r.width < 4 || r.height < 4 || r.width > 90 || r.height > 80) continue;
-      const n=Number(t);
-      if (n < 0 || n > 36) continue;
+      if (r.width < 3 || r.height < 3 || r.width > 110 || r.height > 90) continue;
       records.push({el,n,r});
     }
 
     const containers=new Map();
     for (const rec of records) {
       let p=rec.el;
-      for (let depth=0; depth<10 && p; depth++, p=p.parentElement) {
+      for (let depth=0; depth<14 && p; depth++, p=parentOf(p)) {
         if (!visibleStyle(p)) continue;
         let arr=containers.get(p);
         if (!arr) { arr=[]; containers.set(p,arr); }
@@ -6501,15 +6589,15 @@ HISTORY500_SCAN = r"""
       }
       if (arr.length < 20 || arr.length > 650) continue;
       const r=el.getBoundingClientRect();
-      if (r.width < 120 || r.height < 70) continue;
-      const txt=norm(el.innerText || el.textContent || '');
+      if (r.width < 90 || r.height < 50) continue;
+      const txt=norm(readableText(el));
       let score=arr.length * 3;
-      if (/\b(?:SON|LAST)\s*500\b/.test(txt)) score += 120;
-      if (r.left > innerWidth * 0.45) score += 40;
-      if (r.top > innerHeight * 0.35) score += 25;
-      if (r.right > innerWidth * 0.70) score += 15;
-      if (/BAKIYE|BALANCE|TOPLAM\s*BAHIS|TOTAL\s*BET|BAHIS|BET|OTOMATIK\s*OYUN|AUTOMATIC\s*PLAY|VOISINS|ORPHELINS|TIERS|1INCI|2INCI|3UNCU|1ST|2ND|3RD/.test(txt)) score -= 160;
-      if (/SICAK|SOĞUK|SOGUK|HOT|COLD|GRAFIK|GRAPH|SON\s*500|LAST\s*500/.test(txt)) score += 55;
+      if (/\b(?:SON|LAST)\s*500\b/.test(txt)) score += 150;
+      if (r.left > innerWidth * 0.40) score += 45;
+      if (r.top > innerHeight * 0.25) score += 25;
+      if (r.right > innerWidth * 0.62) score += 15;
+      if (/BAKIYE|BALANCE|TOPLAM\s*BAHIS|TOTAL\s*BET|BAHIS|BET|JETON|CHIP|OTOMATIK\s*OYUN|AUTOMATIC\s*PLAY|VOISINS|ORPHELINS|TIERS|1INCI|2INCI|3UNCU|1ST|2ND|3RD|KOMŞU|KOMSU/.test(txt)) score -= 180;
+      if (/SICAK|SOĞUK|SOGUK|HOT|COLD|GRAFIK|GRAPH|SON\s*500|LAST\s*500|HISTORY|STATISTIC/.test(txt)) score += 70;
       scored.push({root:el, nums:arr.map(x=>x.n), count:arr.length, depth:120, score});
     }
     scored.sort((a,b)=>b.score-a.score || b.count-a.count);
@@ -6522,22 +6610,20 @@ HISTORY500_SCAN = r"""
   if (!roots.length && tab) {
     const tr=tab.getBoundingClientRect();
     const nums=[];
-    for (const el of document.querySelectorAll('*')) {
+    for (const el of deepQueryAll(document, '*')) {
       if (!visibleStyle(el)) continue;
-      const t=norm(el.innerText || el.textContent || '');
-      if (!numRe.test(t)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
       const r=el.getBoundingClientRect();
-      if (r.left < tr.left - 260 || r.right > innerWidth + 5) continue;
-      if (r.top < tr.top + 8 || r.top > innerHeight * 0.95) continue;
-      const n=Number(t);
-      if (n >= 0 && n <= 36) nums.push(n);
+      if (r.left < tr.left - 320 || r.right > innerWidth + 10) continue;
+      if (r.top < tr.top + 4 || r.top > innerHeight * 0.97) continue;
+      nums.push(n);
     }
     if (nums.length >= 20 && nums.length <= 650) {
-      roots.push({root:document.body, nums, count:nums.length, depth:150, score:nums.length});
+      roots.push({root:document.body, nums, count:nums.length, depth:150, score:nums.length + 60});
     }
   }
 
-  // Prefer the block with the most roulette results.
   roots.sort((a,b) => (b.score || b.count) - (a.score || a.count) || b.count - a.count || a.depth - b.depth);
   const best = roots[0] || null;
 
@@ -6551,7 +6637,6 @@ HISTORY500_SCAN = r"""
   };
 })()
 """
-
 
 def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     clicked_json = json.dumps(
@@ -8220,6 +8305,12 @@ class ChromeBridge(threading.Thread):
                 return tid
         return ""
 
+    def _collector_root_session(self):
+        root = str(self.table_scan_target_id or "")
+        if not root:
+            return ""
+        return str(self.target_sessions.get(root, "") or "")
+
     def _is_collector_target_id(self, target_id):
         root = str(self.table_scan_target_id or "")
         tid = str(target_id or "")
@@ -8402,6 +8493,21 @@ class ChromeBridge(threading.Thread):
                 self.state.table_scan_status = f"MASA TARAMA/API ÖĞREN: durdu • {reason}"
         return True
 
+    def _schedule_collector_return(self, sid, delay=0.8):
+        due = time.time() + float(delay or 0.8)
+        sid = str(sid or "")
+        if sid:
+            self.table_scan_click_deadlines[sid] = due
+        if self.table_scan_tab_walk:
+            root_sid = self._collector_root_session()
+            for scan_sid in list(self.session_info.keys()):
+                if not self._is_collector_session(scan_sid):
+                    continue
+                if scan_sid == sid or scan_sid == root_sid or scan_sid in self.table_scan_click_deadlines:
+                    old = float(self.table_scan_click_deadlines.get(scan_sid, 0.0) or 0.0)
+                    self.table_scan_click_deadlines[scan_sid] = min(old, due) if old else due
+        return due
+
     def _return_collector_to_lobby(self, sid, reason="sıradaki masa"):
         if not sid or self.ws is None:
             return False
@@ -8412,36 +8518,55 @@ class ChromeBridge(threading.Thread):
         tid = self._target_id_for_session(sid)
         root = str(self.table_scan_target_id or "")
         try:
-            if tid and root and tid != root:
-                self.send("Target.closeTarget", {"targetId": tid})
-                with self.state.lock:
-                    prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
-                    self.state.table_scan_status = (
-                        f"{prefix}: {reason} • sekme kapatılıyor"
-                    )
-            else:
-                if self.table_scan_tab_walk:
-                    back_js = (
-                        "(() => { try { if (history.length > 1) { history.back(); "
-                        "return 'back'; } location.href = "
-                        + json.dumps(url)
-                        + "; return 'nav'; } catch(e) { location.href = "
-                        + json.dumps(url)
-                        + "; return 'fallback'; } })()"
-                    )
+            if self.table_scan_tab_walk:
+                # V2.9.32: the opened game can live in an OOPIF/child target.
+                # Closing that target looks like the program closed the tab/table.
+                # In single-tab mode never close child targets; always return the
+                # ROOT collector tab to the lobby and continue with the next card.
+                for scan_sid in list(self.table_scan_click_deadlines.keys()):
+                    if self._is_collector_session(scan_sid):
+                        self.table_scan_click_deadlines.pop(scan_sid, None)
+                root_sid = self._collector_root_session() or sid
+                lobby_json = json.dumps(url)
+                back_js = (
+                    "(() => { const L=" + lobby_json + "; try { const before=location.href; "
+                    "if (history.length > 1) { history.back(); "
+                    "setTimeout(() => { try { if (location.href === before) location.href = L; } catch(e) {} }, 1200); "
+                    "return 'back+fallback'; } location.href = L; return 'nav'; } "
+                    "catch(e) { try { location.href = L; } catch(_) {} return 'fallback'; } })()"
+                )
+                return_sids = []
+                for candidate in (sid, root_sid):
+                    if candidate and candidate not in return_sids:
+                        return_sids.append(candidate)
+                # If the table lives in an OOPIF/iframe target, its own history
+                # must go back too; root-only history.back may not affect it.
+                for scan_sid in list(self.session_info.keys()):
+                    if scan_sid not in return_sids and self._is_collector_session(scan_sid):
+                        return_sids.append(scan_sid)
+                for return_sid in return_sids[:8]:
                     self.send(
                         "Runtime.evaluate",
                         {"expression": back_js, "returnByValue": True},
-                        session_id=sid,
+                        session_id=return_sid,
                         kind="collectorback",
-                        context={"session": sid},
+                        context={"session": return_sid, "from": sid},
                     )
-                else:
-                    self.send("Page.navigate", {"url": url}, session_id=sid)
                 with self.state.lock:
-                    prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                     self.state.table_scan_status = (
-                        f"{prefix}: {reason} • lobiye dönülüyor"
+                        f"SEKMELİ TOPLA: {reason} • tek sekme lobiye dönüyor"
+                    )
+            elif tid and root and tid != root:
+                self.send("Target.closeTarget", {"targetId": tid})
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"MASA TARAMA: {reason} • sekme kapatılıyor"
+                    )
+            else:
+                self.send("Page.navigate", {"url": url}, session_id=sid)
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"MASA TARAMA: {reason} • lobiye dönülüyor"
                     )
             return True
         except Exception:
@@ -9574,12 +9699,16 @@ class ChromeBridge(threading.Thread):
                                     row = self.table_scan_probe_targets[probe_tid]
                                     key = str(row.get("key") or key)
                                     row["done_at"] = now
-                                if key not in self.table_scan_probe_success:
+                                success_seen = key in self.table_scan_probe_success
+                                if not success_seen:
                                     self.table_scan_probe_done.add(key)
                                     self.table_scan_probe_fail.add(key)
                                 self.table_scan_current_click_key = ""
                                 self.table_scan_current_click_label = ""
-                                self._return_collector_to_lobby(sid, "veri zaman aşımı")
+                                self._return_collector_to_lobby(
+                                    sid,
+                                    "veri alındı" if success_seen else "veri zaman aşımı"
+                                )
                             else:
                                 self._return_collector_to_lobby(sid, "masa denemesi tamamlandı")
                             continue
@@ -9755,17 +9884,24 @@ class ChromeBridge(threading.Thread):
                                     },
                                 )
 
-                            # V2.9.31: in single-tab collector mode also read
+                            # V2.9.32: in single-tab collector mode also read
                             # the visible SON 500 grid from the opened table.
-                            # The network statisticHistory response can be an
-                            # unexpected schema, while the panel is visible.
+                            # Run this even before tableId is known: the clicked
+                            # lobby-card key is enough to store the bank entry,
+                            # and a later real tableId will overwrite the name.
                             collector_tid = str(
                                 (self.session_table_activity.get(sid, {}) or {}).get("table_id", "")
                                 or ""
                             )
-                            if self.table_scan_tab_walk and collector_tid:
+                            fallback_tid = str(
+                                collector_tid
+                                or self.table_scan_current_click_key
+                                or self.table_scan_last_clicked_label
+                                or sid
+                            )[:180]
+                            if self.table_scan_tab_walk and (self.table_scan_click_deadlines or collector_tid):
                                 hist_key = (sid, context_id, "collector_history500")
-                                if now - float(last_500_scan.get(hist_key, 0.0)) >= 2.5:
+                                if now - float(last_500_scan.get(hist_key, 0.0)) >= 1.8:
                                     last_500_scan[hist_key] = now
                                     hist_params = {
                                         "expression": HISTORY500_SCAN,
@@ -9781,7 +9917,8 @@ class ChromeBridge(threading.Thread):
                                         kind="background500",
                                         context={
                                             "session": sid,
-                                            "table_id": collector_tid,
+                                            "table_id": fallback_tid,
+                                            "real_table_id": collector_tid,
                                             "title": str(
                                                 self.session_info.get(sid, {}).get("title", "")
                                                 or self.table_scan_current_click_label
@@ -10401,7 +10538,7 @@ class ChromeBridge(threading.Thread):
                     )
                     self.state.mark_table_attempt(table_id, ok=True)
                     now_done = time.time()
-                    self.table_scan_click_deadlines[sid_ctx] = now_done + 0.8
+                    self._schedule_collector_return(sid_ctx, 0.8)
                     probe_tid = self._target_id_for_session(sid_ctx)
                     if probe_tid in self.table_scan_probe_targets:
                         row = self.table_scan_probe_targets[probe_tid]
@@ -10415,7 +10552,7 @@ class ChromeBridge(threading.Thread):
                     with self.state.lock:
                         prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                         self.state.table_scan_status = (
-                            f"{prefix}: NETWORK veri alındı • {table_id} • sekme kapatılıyor"
+                            f"{prefix}: NETWORK veri alındı • {table_id} • lobiye dönülüyor"
                         )
                 elif table_id and self.table_scan_tab_walk:
                     with self.state.lock:
@@ -10471,7 +10608,7 @@ class ChromeBridge(threading.Thread):
                         )
                         self.state.mark_table_attempt(table_id, ok=True)
                         now_done = time.time()
-                        self.table_scan_click_deadlines[sid_ctx] = now_done + 0.8
+                        self._schedule_collector_return(sid_ctx, 0.8)
                         probe_tid = self._target_id_for_session(sid_ctx)
                         if probe_tid in self.table_scan_probe_targets:
                             row = self.table_scan_probe_targets[probe_tid]
@@ -10583,10 +10720,46 @@ class ChromeBridge(threading.Thread):
                     source=source_label[:140],
                 )
 
-            # Lobby/game responses from the dedicated background tab are
-            # discovery data only. They must never replace the open table's
-            # live history or prediction input.
-            if self._is_collector_session(str(meta.get("session") or "")):
+            # V2.9.32: while the single-tab collector is inside a real table,
+            # any JSON/text game response may contain the same history payload
+            # even when the URL is not exactly /api/ui/statisticHistory. Try a
+            # generic SON500 extraction before treating collector traffic as
+            # discovery-only.
+            collector_sid = str(meta.get("session") or "")
+            if self._is_collector_session(collector_sid):
+                if self.table_scan_tab_walk and self.table_scan_click_deadlines:
+                    nums = extract_statistic_history(body)
+                    if len(nums) >= 20:
+                        source_url = str(meta.get("url") or "")
+                        try:
+                            u = urllib.parse.urlsplit(source_url)
+                            qs = urllib.parse.parse_qs(u.query)
+                            table_id = str((qs.get("tableId") or [""])[0] or "")
+                        except Exception:
+                            table_id = ""
+                        if not table_id:
+                            table_id = str(
+                                (self.session_table_activity.get(collector_sid, {}) or {}).get("table_id", "")
+                                or self.table_scan_current_click_key
+                                or self.table_scan_last_clicked_label
+                                or collector_sid
+                            )[:180]
+                        self.state.store_background_table_history(
+                            nums,
+                            table_id=table_id,
+                            display_name=str(self.table_scan_last_clicked_label or table_id),
+                            source_label="SEKMELİ TOPLA genel network SON500",
+                        )
+                        self.state.mark_table_attempt(table_id, ok=True)
+                        now_done = time.time()
+                        self._schedule_collector_return(collector_sid, 0.8)
+                        key = str(self.table_scan_current_click_key or table_id)
+                        self.table_scan_probe_done.add(key)
+                        self.table_scan_probe_success.add(key)
+                        with self.state.lock:
+                            self.state.table_scan_status = (
+                                f"SEKMELİ TOPLA: genel network SON500 alındı • {table_id} • {len(nums)}/500 • lobiye dönülüyor"
+                            )
                 return
 
             if "last20Results" not in body:
@@ -10863,7 +11036,7 @@ class ChromeBridge(threading.Thread):
                                 sid_ctx = str(meta.get("session") or "")
                                 now_done = time.time()
                                 if sid_ctx:
-                                    self.table_scan_click_deadlines[sid_ctx] = now_done + 0.8
+                                    self._schedule_collector_return(sid_ctx, 0.8)
                                 key = str(self.table_scan_current_click_key or table_id)
                                 self.table_scan_probe_done.add(key)
                                 self.table_scan_probe_success.add(key)
@@ -11333,7 +11506,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.31 • Görünen SON500")
+        self.root.title("Roulette Pro AI V2.9.32 • SON500 Sabit Bekle")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -11504,7 +11677,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.31 SON500 DOM",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.32 SON500 BEKLE",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
