@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.35: fast lobby continuation after SON500.
-# Ignore stale/lobby preview tableId traffic after returning to Pragmatic lobby;
-# as soon as the in-game Lobby button brings the collector back, clear waits
-# and click the next roulette card quickly.
+# V2.9.36: skip tables without SON500.
+# Some roulette variants do not expose the lower-right SON 500 panel. The
+# collector now detects that condition, marks the table as skipped instead of
+# waiting until the full timeout, returns to lobby, and continues quickly.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -42,6 +42,8 @@ TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
 TAB_WALK_REFRESH_SECONDS = 300.0
 TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
 TAB_WALK_TABLE_MIN_DWELL_SECONDS = 4.0
+TAB_WALK_NO_SON500_SKIP_SECONDS = 18.0
+TAB_WALK_EMPTY_SON500_SKIP_SECONDS = 30.0
 DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
 DGA_DEFAULT_CURRENCY = "TRY"
@@ -7902,6 +7904,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_done = set()
         self.table_scan_probe_success = set()
         self.table_scan_probe_fail = set()
+        self.table_scan_probe_skip = set()
         self.table_scan_probe_queue = []
         self.table_scan_probe_targets = {}
         self.table_scan_probe_urls = set()
@@ -8607,6 +8610,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_done = set()
         self.table_scan_probe_success = set()
         self.table_scan_probe_fail = set()
+        self.table_scan_probe_skip = set()
         self.table_scan_click_deadlines = {}
         self.table_scan_click_started_at = {}
         if self.ws is not None:
@@ -8634,6 +8638,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_done = set()
         self.table_scan_probe_success = set()
         self.table_scan_probe_fail = set()
+        self.table_scan_probe_skip = set()
         self.table_scan_current_click_key = ""
         self.table_scan_current_click_label = ""
         self.table_scan_last_clicked_label = ""
@@ -9547,10 +9552,11 @@ class ChromeBridge(threading.Thread):
             done_count = len(self.table_scan_probe_done)
             ok_count = len(self.table_scan_probe_success)
             fail_count = len(self.table_scan_probe_fail)
+            skip_count = len(getattr(self, "table_scan_probe_skip", set()) or set())
             waiting = bool(self.table_scan_click_deadlines)
             probe_text = (
                 f"tek yan sekme • {'masada veri bekliyor' if waiting else f'kalan {remaining_clicks} kart'} • "
-                f"tamam {done_count} OK {ok_count} hata {fail_count} • "
+                f"tamam {done_count} OK {ok_count} atla {skip_count} hata {fail_count} • "
             )
         else:
             probe_text = (
@@ -10018,15 +10024,19 @@ class ChromeBridge(threading.Thread):
                                     key = str(row.get("key") or key)
                                     row["done_at"] = now
                                 success_seen = key in self.table_scan_probe_success
-                                if not success_seen:
+                                skip_seen = key in getattr(self, "table_scan_probe_skip", set())
+                                if not success_seen and not skip_seen:
                                     self.table_scan_probe_done.add(key)
                                     self.table_scan_probe_fail.add(key)
                                 self.table_scan_current_click_key = ""
                                 self.table_scan_current_click_label = ""
-                                self._return_collector_to_lobby(
-                                    sid,
-                                    "veri alındı" if success_seen else "veri zaman aşımı"
-                                )
+                                if success_seen:
+                                    reason = "veri alındı"
+                                elif skip_seen:
+                                    reason = "SON500 yok • es geçildi"
+                                else:
+                                    reason = "veri zaman aşımı"
+                                self._return_collector_to_lobby(sid, reason)
                             else:
                                 self._return_collector_to_lobby(sid, "masa denemesi tamamlandı")
                             continue
@@ -11444,11 +11454,40 @@ class ChromeBridge(threading.Thread):
                                         f"SEKMELİ TOPLA: sağ-alt SON500 paneli kaydedildi • {display_name[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
                                     )
                         elif is_collector and table_id:
-                            with self.state.lock:
-                                panel_text = "panel görüldü" if panel_seen else "masa paneli bekleniyor"
-                                self.state.table_scan_status = (
-                                    f"SEKMELİ TOPLA: sağ-alt SON500 okunuyor • {display_name[:44]} • {panel_text} • bulunan {len(nums)}"
-                                )
+                            now_wait = time.time()
+                            started = 0.0
+                            if sid_meta:
+                                started = float(self.table_scan_click_started_at.get(sid_meta, 0.0) or 0.0)
+                            if not started:
+                                for v in self.table_scan_click_started_at.values():
+                                    try:
+                                        started = max(started, float(v or 0.0))
+                                    except Exception:
+                                        pass
+                            elapsed = max(0.0, now_wait - started) if started else 0.0
+                            has_son500_tab = bool(value.get("foundTab") or str(value.get("source") or "") == "son500-tab")
+                            skip_no_panel = elapsed >= TAB_WALK_NO_SON500_SKIP_SECONDS and not has_son500_tab
+                            skip_empty_panel = elapsed >= TAB_WALK_EMPTY_SON500_SKIP_SECONDS and has_son500_tab and len(nums) < 20
+                            if skip_no_panel or skip_empty_panel:
+                                key = str(self.table_scan_current_click_key or table_id)
+                                self.table_scan_probe_done.add(key)
+                                self.table_scan_probe_skip.add(key)
+                                self._schedule_collector_return(sid_meta, 0.8)
+                                with self.state.lock:
+                                    self.state.table_scan_status = (
+                                        f"SEKMELİ TOPLA: SON500 yok • {display_name[:44]} • es geçiliyor"
+                                    )
+                            else:
+                                with self.state.lock:
+                                    if has_son500_tab:
+                                        panel_text = "SON500 paneli görüldü"
+                                    elif panel_seen:
+                                        panel_text = "masa paneli var, SON500 aranıyor"
+                                    else:
+                                        panel_text = "masa paneli bekleniyor"
+                                    self.state.table_scan_status = (
+                                        f"SEKMELİ TOPLA: sağ-alt SON500 okunuyor • {display_name[:44]} • {panel_text} • bulunan {len(nums)}"
+                                    )
                 except Exception:
                     pass
 
@@ -11906,7 +11945,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.35 • Hızlı Lobi Devam")
+        self.root.title("Roulette Pro AI V2.9.36 • SON500 Yoksa Atla")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12077,7 +12116,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.35 HIZLI LOBİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.36 SON500 ATLA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
