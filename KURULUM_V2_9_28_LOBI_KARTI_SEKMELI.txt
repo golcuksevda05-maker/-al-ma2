@@ -1,0 +1,25 @@
+ROULETTE PRO AI V2.9.28 LOBİ KARTI + SEKMELİ TOPLAYICI KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.28 LOBİ KARTI yazmalı.
+
+KULLANIM
+1. Programı aç.
+2. VERİ panelinde şu düğmeye bas:
+   SEKMELİ LOBİ TOPLA • 5 DK
+3. Program önce site aramasında Pragmatic Play Lobby kartını bulup Oyna/Play'e basmaya çalışır.
+4. Sonra gerçek Pragmatic Play Lobby içinde Rulet masalarını data-gameid/wow-tile üzerinden tarar.
+5. Her masayı ayrı sekmede açar, veriyi alır, sekmeyi kapatır ve sıradaki masaya geçer.
+6. Tur bitince 5 dakika sonra tekrar eder.
+7. Durdurmak için TARAMAYI DURDUR'a bas.
+
+ÖNEMLİ
+- Masa masa sekmeli gezme için DGA CANLI düğmesi değil, özellikle şu düğme kullanılmalı:
+  SEKMELİ LOBİ TOPLA • 5 DK

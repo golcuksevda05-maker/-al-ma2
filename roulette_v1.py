@@ -25,16 +25,14 @@ DEBUG_PORT = 9222
 PRAGMATIC_LOBBY_SCAN_URL = (
     "https://www.meritbet868.com/tr/live-casino/home"
     "?searchTerm=pragmatic+play+lobby"
-    "&openGames=3300922-real"
-    "&gameNames=Pragmatic%20Play%20Lobby"
 )
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.27: sequential tab-walk lobby collector.
-# Adds a separate mode that keeps the Pragmatic roulette lobby open, opens each
-# detected table in its own Chrome tab, waits for SON500/statisticHistory, closes
-# that tab, continues with the next table, and repeats every 5 minutes.
+# V2.9.28: operator lobby card launcher.
+# The tab-walk collector now starts from the casino search result, clicks the
+# Pragmatic Play Lobby card/Oyna button, then scans the real Pragmatic Rulet
+# lobby tiles by data-gameid and opens them one by one.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -6510,7 +6508,93 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     || path.includes('/apps/lobby/')
     || norm(title).includes('PRAGMATIC PLAY LOBBY');
 
+  function hoverAndClick(el) {{
+    if (!el) return false;
+    try {{ el.scrollIntoView({{block:'center', inline:'center'}}); }} catch (_) {{}}
+    try {{
+      for (const type of ['mouseover','mouseenter','mousemove']) {{
+        el.dispatchEvent(new MouseEvent(type, {{bubbles:true, cancelable:true, view:window}}));
+      }}
+    }} catch (_) {{}}
+    try {{ el.click(); return true; }} catch (_) {{ return false; }}
+  }}
+
+  function operatorLobbyLauncher() {{
+    const lobbyRe=/PRAGMATIC\s*PLAY\s*LOBBY/;
+    const playRe=/\b(OYNA|PLAY|OPEN|AÇ|AC|BAŞLAT|BASLAT|GİR|GIR|ENTER)\b/;
+    const tileSel='[data-testid*="tile" i],[data-testid*="game" i],[class*="card" i],[class*="game" i],[class*="tile" i],article,section';
+    const raw=Array.from(document.querySelectorAll(tileSel+',button,a,[role="button"]')).filter(visible);
+    const tiles=[];
+    const seenTiles=new Set();
+    for (const el of raw) {{
+      const tile=(el.closest && el.closest(tileSel)) || el;
+      if (!tile || !visible(tile) || seenTiles.has(tile)) continue;
+      seenTiles.add(tile);
+      tiles.push(tile);
+    }}
+    for (const tile of tiles) {{
+      const text=norm([
+        tile.innerText,tile.textContent,
+        tile.getAttribute && tile.getAttribute('aria-label'),
+        tile.getAttribute && tile.getAttribute('title'),
+        tile.getAttribute && tile.getAttribute('data-testid')
+      ].join(' '));
+      if (!lobbyRe.test(text)) continue;
+      if (/BLACKJACK|BACCARAT|POKER|SLOT|SWEET|BONANZA/.test(text)) continue;
+      try {{
+        tile.dispatchEvent(new MouseEvent('mouseover', {{bubbles:true, cancelable:true, view:window}}));
+        tile.dispatchEvent(new MouseEvent('mouseenter', {{bubbles:true, cancelable:true, view:window}}));
+      }} catch (_) {{}}
+      const buttons=Array.from(tile.querySelectorAll('button,a,[role="button"],[tabindex]')).filter(visible);
+      const play=buttons.find(b => playRe.test(norm([
+        b.innerText,b.textContent,
+        b.getAttribute && b.getAttribute('aria-label'),
+        b.getAttribute && b.getAttribute('title')
+      ].join(' ')))) || null;
+      const hit=play || clickable(tile) || tile;
+      if (hoverAndClick(hit)) {{
+        return {{
+          ok:true,mode:'navigating',stage:'pragmatic-lobby-card-play',
+          clickedLabel:text.slice(0,120),title,url:href
+        }};
+      }}
+    }}
+
+    // If the search result has not loaded yet, actively type the exact term
+    // shown in the user's screenshot into the casino search field.
+    const inputs=Array.from(document.querySelectorAll('input,textarea,[contenteditable="true"],[role="searchbox"]')).filter(visible);
+    const search=inputs.find(el => {{
+      const meta=norm([
+        el.getAttribute && el.getAttribute('placeholder'),
+        el.getAttribute && el.getAttribute('aria-label'),
+        el.getAttribute && el.getAttribute('title'),
+        el.getAttribute && el.getAttribute('name'),
+        el.id, typeof el.className==='string'?el.className:''
+      ].join(' '));
+      return /ARA|ARAMA|SEARCH|FIND|GAME|OYUN/.test(meta)
+        || String(el.type||'').toLowerCase()==='search';
+    }}) || null;
+    if (search) {{
+      try {{
+        const wanted='pragmatic play lobby';
+        const cur=String(search.value || search.textContent || '').toLowerCase();
+        if (!cur.includes('pragmatic')) {{
+          search.focus();
+          if ('value' in search) search.value=wanted;
+          else search.textContent=wanted;
+          search.dispatchEvent(new Event('input', {{bubbles:true}}));
+          search.dispatchEvent(new Event('change', {{bubbles:true}}));
+          search.dispatchEvent(new KeyboardEvent('keyup', {{bubbles:true,key:'Enter',code:'Enter'}}));
+          return {{ok:true,mode:'navigating',stage:'pragmatic-lobby-search-typed',title,url:href}};
+        }}
+      }} catch (_) {{}}
+    }}
+    return null;
+  }}
+
   if (!providerContext) {{
+    const launched=operatorLobbyLauncher();
+    if (launched) return launched;
     return {{ok:true,mode:'waiting',stage:'provider-context',title,url:href}};
   }}
 
@@ -6640,24 +6724,44 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
   const candidates=Array.from(document.querySelectorAll(tileSelector));
   if (!candidates.length) candidates.push(...Array.from(document.querySelectorAll('a,button,[role="button"],div,span')));
 
+  const rouletteHeading=Array.from(document.querySelectorAll('h1,h2,h3,[role="heading"]'))
+    .some(el => visible(el) && /^(RULET|ROULETTE)$/.test(norm(el.innerText || el.textContent)));
+  const rouletteContext = rouletteHeading
+    || categoryState === 'selected'
+    || (path.includes('/apps/lobby/') && /\b(RULET|ROULETTE)\b/.test(bodyText));
+
   for (const raw of candidates.slice(0,3500)) {{
     if (!visible(raw)) continue;
     const tile=raw.closest && raw.closest(tileSelector) || raw;
     if (!visible(tile)) continue;
-    const text=norm(tile.innerText || tile.textContent || raw.innerText || raw.textContent);
-    if (!text || text.length>320 || !/(ROULETTE|RULET)/.test(text)) continue;
+
+    let tableId=firstAttrInTree(tile, ['data-table-id','data-tableid','tableid','table-id','data-table_id']);
+    let gameId=firstAttrInTree(tile, ['data-gameid','data-game-id','gameid','game-id','data-game_id']);
+    const text=norm([
+      tile.innerText,tile.textContent,raw.innerText,raw.textContent,
+      tile.getAttribute && tile.getAttribute('aria-label'),
+      tile.getAttribute && tile.getAttribute('title')
+    ].join(' '));
+    const textLooksRoulette=/(ROULETTE|RULET)/.test(text);
+    if ((!text && !tableId && !gameId) || text.length>520) continue;
+    if (!textLooksRoulette && !(rouletteContext && (tableId || gameId))) continue;
     if (badCardText.test(text)) continue;
     if (categoryLabels.has(text)) continue;
 
     const hit=clickable(tile) || tile;
     if (!hit || !visible(hit)) continue;
-    const label=norm(hit.innerText || hit.textContent || text).slice(0,260);
-    if (!/(ROULETTE|RULET)/.test(label) || badCardText.test(label)) continue;
+    let label=norm([
+      hit.innerText,hit.textContent,text,
+      hit.getAttribute && hit.getAttribute('aria-label'),
+      hit.getAttribute && hit.getAttribute('title')
+    ].join(' ')).slice(0,260);
+    if (!/(ROULETTE|RULET)/.test(label) && !(rouletteContext && (gameId || tableId))) continue;
+    if (badCardText.test(label)) continue;
 
     let href=hrefOf(hit) || hrefOf(tile);
     const testid=String(hit.getAttribute && hit.getAttribute('data-testid') || tile.getAttribute && tile.getAttribute('data-testid') || '');
-    let tableId=firstAttrInTree(hit, ['data-table-id','data-tableid','tableid','table-id','data-table_id']);
-    let gameId=firstAttrInTree(hit, ['data-gameid','data-game-id','gameid','game-id','data-game_id']);
+    tableId = tableId || firstAttrInTree(hit, ['data-table-id','data-tableid','tableid','table-id','data-table_id']);
+    gameId = gameId || firstAttrInTree(hit, ['data-gameid','data-game-id','gameid','game-id','data-game_id']);
 
     if (href) {{
       try {{
@@ -6668,9 +6772,10 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
       }} catch (_) {{}}
     }}
 
-    // V2.9.15: do not synthesize/open deep links from data-gameid.
-    // Some sites show a black Pragmatic splash forever in background tabs.
-    // If a real tableId is not visible, we wait for lobby/network metadata.
+    if (!label && (gameId || tableId)) label = 'ROULETTE ' + (gameId || tableId);
+    if (!/(ROULETTE|RULET)/.test(label) && rouletteContext && gameId) {{
+      label = ('ROULETTE ' + gameId + ' ' + label).trim().slice(0,260);
+    }}
 
     const key=(tableId || gameId || href || label+'|'+testid).slice(0,420);
     if (!key || seen.has(key)) continue;
@@ -8777,7 +8882,11 @@ class ChromeBridge(threading.Thread):
             return
 
         if mode == "navigating":
-            if stage == "menu-opened":
+            if stage == "pragmatic-lobby-card-play":
+                message = "site aramasındaki Pragmatic Play Lobby kartında Oyna tıklandı"
+            elif stage == "pragmatic-lobby-search-typed":
+                message = "arama kutusuna pragmatic play lobby yazıldı"
+            elif stage == "menu-opened":
                 message = "sol kategori menüsü açıldı • Rulet seçiliyor"
             elif stage == "roulette-selecting":
                 message = "Rulet kategorisi seçiliyor"
@@ -10946,7 +11055,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.27 • Sekmeli Lobi Toplayıcı")
+        self.root.title("Roulette Pro AI V2.9.28 • Lobi Kartı + Sekmeli Topla")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -11117,7 +11226,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.27 SEKMELİ TOPLA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.28 LOBİ KARTI",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -13268,9 +13377,8 @@ def table_scan_self_test():
     assert PRAGMATIC_LOBBY_SCAN_URL == (
         "https://www.meritbet868.com/tr/live-casino/home"
         "?searchTerm=pragmatic+play+lobby"
-        "&openGames=3300922-real"
-        "&gameNames=Pragmatic%20Play%20Lobby"
     )
+    assert "pragmatic-lobby-card-play" in nav_script
     assert "open_card" not in nav_script
     assert "scrollTarget.scrollBy" in nav_script
     assert "roulette-selecting" in nav_script
