@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.33: single-tab collector waits on the real SON500 panel.
-# It does not accept instant/weak lobby responses as success; it reads the
-# bottom-right SON 500 grid above Automatic Play, waits a minimum dwell time,
-# saves that table, then returns to lobby for the next table.
+# V2.9.34: return through the in-game Lobby button.
+# After reading the lower-right SON500 panel, the collector clicks the game
+# screen's top-right Lobi/Lobby button instead of going back to the operator
+# search page and typing Pragmatic Play Lobby again.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -6714,6 +6714,141 @@ HISTORY500_SCAN = r"""
 })()
 """
 
+COLLECTOR_LOBBY_CLICK_SCRIPT = r"""
+(() => {
+  const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[İı]/g, 'I').replace(/\s+/g, ' ').trim().toUpperCase();
+  const visible = el => {
+    try {
+      const s = getComputedStyle(el), r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4 &&
+             s.display !== 'none' && s.visibility !== 'hidden' &&
+             Number(s.opacity || 1) !== 0;
+    } catch (_) { return false; }
+  };
+  function deepAll(root, selector) {
+    const out = [];
+    const seenRoots = new Set();
+    const add = el => { if (el && !out.includes(el)) out.push(el); };
+    function walk(r) {
+      if (!r || seenRoots.has(r)) return;
+      seenRoots.add(r);
+      let nodes = [];
+      try { nodes = Array.from(r.querySelectorAll(selector)); } catch (_) { nodes = []; }
+      for (const n of nodes) add(n);
+      let all = [];
+      try { all = Array.from(r.querySelectorAll('*')); } catch (_) { all = []; }
+      for (const el of all) {
+        try { if (el.shadowRoot) walk(el.shadowRoot); } catch (_) {}
+        try {
+          if (String(el.tagName || '').toUpperCase() === 'IFRAME' && el.contentDocument) walk(el.contentDocument);
+        } catch (_) {}
+      }
+    }
+    walk(root);
+    return out;
+  }
+  function metaText(el) {
+    const vals = [];
+    try { vals.push(el.innerText || ''); } catch (_) {}
+    try { vals.push(el.textContent || ''); } catch (_) {}
+    for (const a of ['aria-label','title','alt','data-testid','data-test','id','class']) {
+      try { vals.push(el.getAttribute(a) || ''); } catch (_) {}
+    }
+    return vals.join(' ');
+  }
+  function clickIt(el) {
+    try { el.scrollIntoView({block:'center', inline:'center'}); } catch (_) {}
+    try {
+      for (const t of ['pointerover','mouseover','mouseenter','mousemove','pointerdown','mousedown','pointerup','mouseup']) {
+        el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}));
+      }
+    } catch (_) {}
+    try { el.click(); return true; } catch (_) { return false; }
+  }
+  function clickable(el) {
+    let p = el;
+    for (let i = 0; i < 7 && p; i++, p = p.parentElement) {
+      try {
+        if (p.matches && p.matches('button,a,[role="button"],[tabindex]')) return p;
+        if (p.onclick || getComputedStyle(p).cursor === 'pointer') return p;
+      } catch (_) {}
+    }
+    return el;
+  }
+
+  const candidates = deepAll(document, 'button,a,[role="button"],[tabindex],div,span');
+  const scored = [];
+  for (const el of candidates) {
+    if (!visible(el)) continue;
+    const hit = clickable(el);
+    if (!hit || !visible(hit)) continue;
+    const r = hit.getBoundingClientRect();
+    const text = norm(metaText(el) + ' ' + metaText(hit));
+    let score = 0;
+    if (/\b(LOBI|LOBBY)\b/.test(text)) score += 300;
+    if (/PRAGMATIC\s*(PLAY)?\s*(LOBI|LOBBY)/.test(text)) score += 80;
+    if (r.top <= innerHeight * 0.24) score += 55;
+    if (r.left >= innerWidth * 0.55) score += 55;
+    if (r.width >= 35 && r.width <= 180 && r.height >= 24 && r.height <= 90) score += 30;
+    if (/ARAMA|SEARCH|OYUN\s*ARA|BAHIS|BET|SPIN|OTOMAT|AUTOMATIC|CHAT|SOUND|SES|AYAR|SETTING|GECMIS|HISTORY|SON\s*500|LAST\s*500/.test(text)) score -= 220;
+    if (score >= 260) scored.push({el:hit, score, text:text.slice(0,80), x:Math.round(r.x), y:Math.round(r.y)});
+  }
+  scored.sort((a,b) => b.score - a.score || b.x - a.x);
+  if (scored.length) {
+    const ok = clickIt(scored[0].el);
+    return {
+      ok,
+      clicked: ok,
+      stage: 'in-game-lobby-button',
+      text: scored[0].text,
+      title: document.title || '',
+      url: location.href
+    };
+  }
+
+  // Fallback inside the same game UI: the round back arrow next to the Lobi
+  // button usually goes to the Pragmatic lobby too. Do NOT navigate to the
+  // operator search page from here.
+  const backScored = [];
+  for (const el of candidates) {
+    if (!visible(el)) continue;
+    const hit = clickable(el);
+    if (!hit || !visible(hit)) continue;
+    const r = hit.getBoundingClientRect();
+    const text = norm(metaText(el) + ' ' + metaText(hit));
+    let score = 0;
+    if (/\b(BACK|GERI|GERİ|ARROW|CHEVRON|CLOSE|KAPAT)\b/.test(text)) score += 120;
+    if (r.top <= innerHeight * 0.22) score += 45;
+    if (r.left >= innerWidth * 0.50) score += 35;
+    if (r.width >= 24 && r.width <= 75 && r.height >= 24 && r.height <= 75) score += 35;
+    if (/CHAT|SOUND|SES|AYAR|SETTING|LOBI|LOBBY/.test(text)) score -= 40;
+    if (score >= 170) backScored.push({el:hit, score, text:text.slice(0,80), x:Math.round(r.x), y:Math.round(r.y)});
+  }
+  backScored.sort((a,b) => b.score - a.score || b.x - a.x);
+  if (backScored.length) {
+    const ok = clickIt(backScored[0].el);
+    return {
+      ok,
+      clicked: ok,
+      stage: 'in-game-back-button',
+      text: backScored[0].text,
+      title: document.title || '',
+      url: location.href
+    };
+  }
+
+  return {
+    ok: false,
+    clicked: false,
+    stage: 'lobby-button-not-found',
+    title: document.title || '',
+    url: location.href
+  };
+})()
+"""
+
+
 def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     clicked_json = json.dumps(
         [str(x) for x in list(clicked_keys or [])[:2500]],
@@ -8640,55 +8775,49 @@ class ChromeBridge(threading.Thread):
                     self.table_scan_click_started_at.setdefault(scan_sid, (started or now) if self.table_scan_tab_walk else now)
         return due
 
-    def _return_collector_to_lobby(self, sid, reason="sıradaki masa"): 
+    def _return_collector_to_lobby(self, sid, reason="sıradaki masa"):
         if not sid or self.ws is None:
             return False
         url = str(self.table_scan_entry_url or self._collector_launch_url() or "")
-        if not url:
-            return False
         self.table_scan_click_deadlines.pop(sid, None)
         self.table_scan_click_started_at.pop(sid, None)
         tid = self._target_id_for_session(sid)
         root = str(self.table_scan_target_id or "")
         try:
             if self.table_scan_tab_walk:
-                # V2.9.32: the opened game can live in an OOPIF/child target.
-                # Closing that target looks like the program closed the tab/table.
-                # In single-tab mode never close child targets; always return the
-                # ROOT collector tab to the lobby and continue with the next card.
+                # V2.9.34: after reading the game's lower-right SON500 panel,
+                # return by clicking the in-game top-right Lobi/Lobby button.
+                # Do not history.back() to the operator search page; that caused
+                # the collector to get stuck typing "pragmatic play lobby" again.
                 for scan_sid in list(self.table_scan_click_deadlines.keys()):
                     if self._is_collector_session(scan_sid):
                         self.table_scan_click_deadlines.pop(scan_sid, None)
                         self.table_scan_click_started_at.pop(scan_sid, None)
                 root_sid = self._collector_root_session() or sid
-                lobby_json = json.dumps(url)
-                back_js = (
-                    "(() => { const L=" + lobby_json + "; try { const before=location.href; "
-                    "if (history.length > 1) { history.back(); "
-                    "setTimeout(() => { try { if (location.href === before) location.href = L; } catch(e) {} }, 1200); "
-                    "return 'back+fallback'; } location.href = L; return 'nav'; } "
-                    "catch(e) { try { location.href = L; } catch(_) {} return 'fallback'; } })()"
-                )
                 return_sids = []
                 for candidate in (sid, root_sid):
                     if candidate and candidate not in return_sids:
                         return_sids.append(candidate)
-                # If the table lives in an OOPIF/iframe target, its own history
-                # must go back too; root-only history.back may not affect it.
+                # The button may live in the root page or a Pragmatic OOPIF.
+                # Send the same safe click probe to every collector session.
                 for scan_sid in list(self.session_info.keys()):
                     if scan_sid not in return_sids and self._is_collector_session(scan_sid):
                         return_sids.append(scan_sid)
-                for return_sid in return_sids[:8]:
+                for return_sid in return_sids[:10]:
                     self.send(
                         "Runtime.evaluate",
-                        {"expression": back_js, "returnByValue": True},
+                        {
+                            "expression": COLLECTOR_LOBBY_CLICK_SCRIPT,
+                            "returnByValue": True,
+                            "awaitPromise": True,
+                        },
                         session_id=return_sid,
                         kind="collectorback",
-                        context={"session": return_sid, "from": sid},
+                        context={"session": return_sid, "from": sid, "reason": reason},
                     )
                 with self.state.lock:
                     self.state.table_scan_status = (
-                        f"SEKMELİ TOPLA: {reason} • tek sekme lobiye dönüyor"
+                        f"SEKMELİ TOPLA: {reason} • oyun içi Lobi düğmesine basılıyor"
                     )
             elif tid and root and tid != root:
                 self.send("Target.closeTarget", {"targetId": tid})
@@ -8697,6 +8826,8 @@ class ChromeBridge(threading.Thread):
                         f"MASA TARAMA: {reason} • sekme kapatılıyor"
                     )
             else:
+                if not url:
+                    return False
                 self.send("Page.navigate", {"url": url}, session_id=sid)
                 with self.state.lock:
                     self.state.table_scan_status = (
@@ -11123,6 +11254,27 @@ class ChromeBridge(threading.Thread):
                 except Exception:
                     pass
 
+            elif kind == "collectorback":
+                try:
+                    value = obj.get("result",{}).get("result",{}).get("value")
+                    if isinstance(value, dict):
+                        stage = str(value.get("stage") or "")
+                        clicked = bool(value.get("clicked"))
+                        if clicked:
+                            self.table_scan_last_view = time.time()
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    "SEKMELİ TOPLA: oyun içi Lobi düğmesi tıklandı • Pragmatic Rulet lobisi bekleniyor"
+                                )
+                        elif stage == "lobby-button-not-found":
+                            with self.state.lock:
+                                if "Lobi düğmesine basılıyor" in str(self.state.table_scan_status):
+                                    self.state.table_scan_status = (
+                                        "SEKMELİ TOPLA: oyun içi Lobi düğmesi aranıyor • arama sayfasına dönülmeyecek"
+                                    )
+                except Exception:
+                    pass
+
             elif kind == "visibility":
                 try:
                     value = obj.get("result",{}).get("result",{}).get("value")
@@ -11688,7 +11840,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.33 • SON500 Panel Bekle")
+        self.root.title("Roulette Pro AI V2.9.34 • Oyun İçi Lobi")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -11859,7 +12011,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.33 SON500 PANEL",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.34 OYUN İÇİ LOBİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
