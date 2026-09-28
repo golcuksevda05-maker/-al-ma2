@@ -1,0 +1,23 @@
+ROULETTE PRO AI V2.9.38 SON500 ANINDA ATLA KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.38 ANINDA ATLA yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+2. Program masaları tek yan sekmede gezer.
+3. SON500 olan masalarda 500 spin verisini kaydeder.
+4. SON500 olmayan masalarda masa ekranını algılar, 'SON500 paneli yok' der ve hemen Lobi düğmesine basıp sıradaki masaya geçer.
+
+500 SPİN KONTROLÜ
+- VERİ DURUMU içinde 'PRAGMATIC DIRECT: 500/500' veya 'PRAGMATIC statisticHistory network: 500/500' görürsen veri çekilmiştir.
+- 'UZUN MASA ARŞİVİ: 500+' o masanın arşive yazıldığını gösterir.
+- 'MASA BANKALARINI GÖR' ile masa masa kayıtları görebilirsin.

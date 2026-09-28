@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.37: skip-without-sticking fix.
-# Some tables have no SON500 panel. When detected, mark the table as skipped,
-# clear the wait immediately, press the in-game Lobby button, and continue to
-# the next card instead of staying on "es geçiliyor".
+# V2.9.38: instant skip for active tables without SON500.
+# If the collector is visibly inside a roulette table but no SON500 tab/panel
+# exists, it no longer misclassifies the game as lobby; it immediately marks
+# the table as skipped, clicks in-game Lobi, and continues.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -42,8 +42,8 @@ TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
 TAB_WALK_REFRESH_SECONDS = 300.0
 TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
 TAB_WALK_TABLE_MIN_DWELL_SECONDS = 4.0
-TAB_WALK_NO_SON500_SKIP_SECONDS = 18.0
-TAB_WALK_EMPTY_SON500_SKIP_SECONDS = 30.0
+TAB_WALK_NO_SON500_SKIP_SECONDS = 6.0
+TAB_WALK_EMPTY_SON500_SKIP_SECONDS = 12.0
 DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
 DGA_DEFAULT_CURRENCY = "TRY"
@@ -7012,6 +7012,42 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
   const visibleControls=Array.from(document.querySelectorAll(
     'button,a,[role="button"],[tabindex],div,span'
   )).filter(visible);
+
+  // V2.9.38: Some variants (for example PowerUP/Kristal-style tables) open
+  // a real roulette table but do not expose a SON 500 tab/panel. Previously
+  // the generic lobby scanner could misread the betting grid/racetrack as
+  // lobby content and stay on the table. If we are clearly inside the game UI
+  // and there is no SON500 control, tell Python to skip this table now.
+  const hasSon500Control = visibleControls.some(el => {{
+    const t = norm([
+      el.innerText, el.textContent,
+      el.getAttribute && el.getAttribute('aria-label'),
+      el.getAttribute && el.getAttribute('title'),
+      el.getAttribute && el.getAttribute('data-testid')
+    ].join(' '));
+    return /\b(SON|LAST)\s*500\b/.test(t);
+  }});
+  const hasInGameLobbyButton = visibleControls.some(el => {{
+    const r = el.getBoundingClientRect();
+    const t = norm([
+      el.innerText, el.textContent,
+      el.getAttribute && el.getAttribute('aria-label'),
+      el.getAttribute && el.getAttribute('title'),
+      el.getAttribute && el.getAttribute('data-testid')
+    ].join(' '));
+    return /\b(LOBI|LOBBY)\b/.test(t) && r.top <= innerHeight * 0.24 && r.left >= innerWidth * 0.50;
+  }});
+  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS/.test(bodyText);
+  if (hasInGameLobbyButton && activeGameUi && !hasSon500Control) {{
+    return {{
+      ok:true,
+      mode:'game_no_son500',
+      stage:'active-game-no-son500',
+      title,url:href,
+      reason:'SON500 paneli yok'
+    }};
+  }}
+
   const categoryLabels=new Set(['RULET','ROULETTE','RULET MASALARI','ROULETTE TABLES']);
   const category=visibleControls.map(el => {{
     const label=norm(el.innerText || el.textContent);
@@ -9405,6 +9441,26 @@ class ChromeBridge(threading.Thread):
             self.table_scan_last_view = now
 
         prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+
+        if mode == "game_no_son500":
+            key = str(self.table_scan_current_click_key or self.table_scan_last_clicked_label or sid)
+            if key:
+                self.table_scan_probe_done.add(key)
+                self.table_scan_probe_skip.add(key)
+            label = self._clean_collector_label(
+                self.table_scan_current_click_label
+                or self.table_scan_last_clicked_label
+                or str(value.get("title") or "Roulette"),
+                fallback="Roulette",
+            )
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    f"{prefix}: SON500 paneli yok • {label[:44]} • anında es geçiliyor"
+                )
+            self._return_collector_to_lobby(sid, "SON500 paneli yok • es geçildi")
+            self.table_scan_current_click_key = ""
+            self.table_scan_current_click_label = ""
+            return
 
         if mode == "waiting":
             if now - float(self.table_scan_last_view or 0.0) < 8.0:
@@ -11960,7 +12016,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.37 • Atla ve Devam")
+        self.root.title("Roulette Pro AI V2.9.38 • SON500 Anında Atla")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12131,7 +12187,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.37 ATLA DEVAM",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.38 ANINDA ATLA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
