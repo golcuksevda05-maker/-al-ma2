@@ -1,0 +1,22 @@
+ROULETTE PRO AI V2.9.31 GÖRÜNÜR SON500 KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.31 SON500 DOM yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+2. Program yan collector sekmesinde lobiye girer ve masayı gerçek tıklama ile açar.
+3. Masa açılınca hem statisticHistory network cevabını hem de ekranda görünen SON 500 panelini okur.
+4. Görünen panelden en az 20 sayı alırsa masa bankasına kaydeder ve lobiye döner.
+5. Durdurmak için TARAMAYI DURDUR'a bas.
+
+NOT
+- Bu sürüm, ekranda SON 500 sayıları görünmesine rağmen network cevabı ayrıştırılamadığı durumlar için yapıldı.

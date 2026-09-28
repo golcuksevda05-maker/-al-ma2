@@ -29,10 +29,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.30: single collector-tab lobby walker.
-# The fallback collector no longer opens synthetic table URLs in extra tabs.
-# It keeps one side Chrome tab, actually clicks roulette tiles in the lobby,
-# waits for SON500/statisticHistory, then goes back and clicks the next tile.
+# V2.9.31: visible SON500 DOM collector.
+# When statisticHistory response schema cannot be parsed, the collector now
+# reads the visible SON 500 panel/grid from the actual opened table DOM before
+# leaving the table.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -6450,14 +6450,95 @@ HISTORY500_SCAN = r"""
           root: el,
           nums,
           count: nums.length,
-          depth: 99
+          depth: 99,
+          score: nums.length * 2 + 20
         });
       }
     }
   }
 
+  // V2.9.31: the user's screen shows SON 500 as a visible grid on the
+  // lower-right game panel. Some builds do not keep the "SON 500" label in
+  // the same DOM block as the numbers. Build dense numeric clusters by layout
+  // and pick the largest non-betting cluster.
+  if (!roots.length) {
+    const records=[];
+    for (const el of document.querySelectorAll('*')) {
+      if (!visibleStyle(el)) continue;
+      const t=norm(el.innerText || el.textContent || '');
+      if (!numRe.test(t)) continue;
+      let childNumeric=false;
+      for (const ch of el.children) {
+        if (numRe.test(norm(ch.innerText || ch.textContent || ''))) {
+          childNumeric=true; break;
+        }
+      }
+      if (childNumeric) continue;
+      const r=el.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4 || r.width > 90 || r.height > 80) continue;
+      const n=Number(t);
+      if (n < 0 || n > 36) continue;
+      records.push({el,n,r});
+    }
+
+    const containers=new Map();
+    for (const rec of records) {
+      let p=rec.el;
+      for (let depth=0; depth<10 && p; depth++, p=p.parentElement) {
+        if (!visibleStyle(p)) continue;
+        let arr=containers.get(p);
+        if (!arr) { arr=[]; containers.set(p,arr); }
+        arr.push(rec);
+      }
+    }
+
+    const scored=[];
+    for (const [el, arrRaw] of containers.entries()) {
+      const seenEls=new Set();
+      const arr=[];
+      for (const rec of arrRaw) {
+        if (!seenEls.has(rec.el)) { seenEls.add(rec.el); arr.push(rec); }
+      }
+      if (arr.length < 20 || arr.length > 650) continue;
+      const r=el.getBoundingClientRect();
+      if (r.width < 120 || r.height < 70) continue;
+      const txt=norm(el.innerText || el.textContent || '');
+      let score=arr.length * 3;
+      if (/\b(?:SON|LAST)\s*500\b/.test(txt)) score += 120;
+      if (r.left > innerWidth * 0.45) score += 40;
+      if (r.top > innerHeight * 0.35) score += 25;
+      if (r.right > innerWidth * 0.70) score += 15;
+      if (/BAKIYE|BALANCE|TOPLAM\s*BAHIS|TOTAL\s*BET|BAHIS|BET|OTOMATIK\s*OYUN|AUTOMATIC\s*PLAY|VOISINS|ORPHELINS|TIERS|1INCI|2INCI|3UNCU|1ST|2ND|3RD/.test(txt)) score -= 160;
+      if (/SICAK|SOĞUK|SOGUK|HOT|COLD|GRAFIK|GRAPH|SON\s*500|LAST\s*500/.test(txt)) score += 55;
+      scored.push({root:el, nums:arr.map(x=>x.n), count:arr.length, depth:120, score});
+    }
+    scored.sort((a,b)=>b.score-a.score || b.count-a.count);
+    if (scored.length) roots.push(scored[0]);
+  }
+
+  // Last fallback: if a SON500 tab is visible, take numbers in a rectangle
+  // below/near it. This matches the screenshot where the grid sits directly
+  // under the "SON 500" tab and above the Automatic Play button.
+  if (!roots.length && tab) {
+    const tr=tab.getBoundingClientRect();
+    const nums=[];
+    for (const el of document.querySelectorAll('*')) {
+      if (!visibleStyle(el)) continue;
+      const t=norm(el.innerText || el.textContent || '');
+      if (!numRe.test(t)) continue;
+      const r=el.getBoundingClientRect();
+      if (r.left < tr.left - 260 || r.right > innerWidth + 5) continue;
+      if (r.top < tr.top + 8 || r.top > innerHeight * 0.95) continue;
+      const n=Number(t);
+      if (n >= 0 && n <= 36) nums.push(n);
+    }
+    if (nums.length >= 20 && nums.length <= 650) {
+      roots.push({root:document.body, nums, count:nums.length, depth:150, score:nums.length});
+    }
+  }
+
   // Prefer the block with the most roulette results.
-  roots.sort((a,b) => b.count - a.count || a.depth - b.depth);
+  roots.sort((a,b) => (b.score || b.count) - (a.score || a.count) || b.count - a.count || a.depth - b.depth);
   const best = roots[0] || null;
 
   return {
@@ -9674,6 +9755,41 @@ class ChromeBridge(threading.Thread):
                                     },
                                 )
 
+                            # V2.9.31: in single-tab collector mode also read
+                            # the visible SON 500 grid from the opened table.
+                            # The network statisticHistory response can be an
+                            # unexpected schema, while the panel is visible.
+                            collector_tid = str(
+                                (self.session_table_activity.get(sid, {}) or {}).get("table_id", "")
+                                or ""
+                            )
+                            if self.table_scan_tab_walk and collector_tid:
+                                hist_key = (sid, context_id, "collector_history500")
+                                if now - float(last_500_scan.get(hist_key, 0.0)) >= 2.5:
+                                    last_500_scan[hist_key] = now
+                                    hist_params = {
+                                        "expression": HISTORY500_SCAN,
+                                        "returnByValue": True,
+                                        "awaitPromise": True,
+                                    }
+                                    if context_id is not None:
+                                        hist_params["contextId"] = int(context_id)
+                                    self.send(
+                                        "Runtime.evaluate",
+                                        hist_params,
+                                        session_id=sid,
+                                        kind="background500",
+                                        context={
+                                            "session": sid,
+                                            "table_id": collector_tid,
+                                            "title": str(
+                                                self.session_info.get(sid, {}).get("title", "")
+                                                or self.table_scan_current_click_label
+                                            ),
+                                            "collector": True,
+                                        },
+                                    )
+
                             if self.table_scan_tab_walk and self.table_scan_click_deadlines:
                                 continue
 
@@ -10731,12 +10847,35 @@ class ChromeBridge(threading.Thread):
                         )
                         table_id = str(meta.get("table_id","") or "")
                         if len(nums) >= 20 and table_id:
+                            source_label = (
+                                "SEKMELİ TOPLA görünür SON500"
+                                if bool(meta.get("collector"))
+                                else "ARKA PLAN SON500"
+                            )
                             self.state.store_background_table_history(
                                 nums,
                                 table_id=table_id,
                                 display_name=title,
-                                source_label="ARKA PLAN SON500",
+                                source_label=source_label,
                             )
+                            self.state.mark_table_attempt(table_id, ok=True)
+                            if bool(meta.get("collector")):
+                                sid_ctx = str(meta.get("session") or "")
+                                now_done = time.time()
+                                if sid_ctx:
+                                    self.table_scan_click_deadlines[sid_ctx] = now_done + 0.8
+                                key = str(self.table_scan_current_click_key or table_id)
+                                self.table_scan_probe_done.add(key)
+                                self.table_scan_probe_success.add(key)
+                                with self.state.lock:
+                                    self.state.table_scan_status = (
+                                        f"SEKMELİ TOPLA: görünür SON500 alındı • {table_id} • {len(nums)}/500 • lobiye dönülüyor"
+                                    )
+                        elif bool(meta.get("collector")) and table_id:
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: görünür SON500 bekleniyor • {table_id} • bulunan {len(nums)}"
+                                )
                 except Exception:
                     pass
 
@@ -11194,7 +11333,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.30 • Tek Sekme Toplayıcı")
+        self.root.title("Roulette Pro AI V2.9.31 • Görünen SON500")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -11365,7 +11504,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.30 TEK SEKME",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.31 SON500 DOM",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
