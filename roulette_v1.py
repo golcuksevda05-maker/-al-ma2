@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.34: return through the in-game Lobby button.
-# After reading the lower-right SON500 panel, the collector clicks the game
-# screen's top-right Lobi/Lobby button instead of going back to the operator
-# search page and typing Pragmatic Play Lobby again.
+# V2.9.35: fast lobby continuation after SON500.
+# Ignore stale/lobby preview tableId traffic after returning to Pragmatic lobby;
+# as soon as the in-game Lobby button brings the collector back, clear waits
+# and click the next roulette card quickly.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -41,7 +41,7 @@ COLLECTOR_CARD_CLICK_SECONDS = 10.0
 TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
 TAB_WALK_REFRESH_SECONDS = 300.0
 TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
-TAB_WALK_TABLE_MIN_DWELL_SECONDS = 12.0
+TAB_WALK_TABLE_MIN_DWELL_SECONDS = 4.0
 DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
 DGA_DEFAULT_CURRENCY = "TRY"
@@ -6701,12 +6701,44 @@ HISTORY500_SCAN = r"""
   roots.sort((a,b) => (b.score || b.count) - (a.score || a.count) || b.count - a.count || a.depth - b.depth);
   const best = roots[0] || null;
 
+  // If the collector has already returned to Pragmatic Roulette lobby, there
+  // will be multiple roulette table cards and no Automatic Play/SON500 panel.
+  // Report this so Python can clear a stale wait and immediately click next.
+  const lobbyTileSelector = [
+    '[data-gameid]','[data-game-id]','[data-table-id]','[data-tableid]',
+    '[data-testid="wow-tile"]','[data-testid*="tile" i]',
+    '[data-testid*="game" i]','[data-testid*="table" i]',
+    '[class*="tile" i]','[class*="card" i]','[class*="game" i]'
+  ].join(',');
+  let lobbyCardCount = 0;
+  try {
+    const seenCards = new Set();
+    for (const el of deepQueryAll(document, lobbyTileSelector)) {
+      if (!visibleStyle(el)) continue;
+      const txt = norm(readableText(el));
+      const hasId = !!(el.getAttribute('data-gameid') || el.getAttribute('data-game-id') || el.getAttribute('data-table-id') || el.getAttribute('data-tableid'));
+      if (!hasId && !/(ROULETTE|RULET)/.test(txt)) continue;
+      if (/BLACKJACK|BACCARAT|POKER|HISTORY|SON\s*500|LAST\s*500|OTOMAT|AUTOMATIC/.test(txt)) continue;
+      const key = (txt.slice(0,80) + '|' + (el.getAttribute('data-gameid') || el.getAttribute('data-table-id') || '')).slice(0,140);
+      if (seenCards.has(key)) continue;
+      seenCards.add(key);
+      lobbyCardCount += 1;
+    }
+  } catch (_) {}
+  const bodyT = norm(readableText(document.body || document.documentElement));
+  const lobbyLike = !autoFound && !best && (
+    lobbyCardCount >= 3 ||
+    (/\bRULET\b|\bROULETTE\b/.test(bodyT) && /STANDART|TURKCE|TÜRKÇE|HIZLI|PRIVE|PRIVÉ|VERSIYON/.test(bodyT) && lobbyCardCount >= 1)
+  );
+
   return {
     title: document.title,
     url: location.href,
     expandedDrawer,
     foundTab: !!tab,
     autoFound,
+    lobbyLike,
+    lobbyCardCount,
     source: best ? (best.source || '') : '',
     count: best ? best.nums.length : 0,
     nums: best ? best.nums.slice(0, 500) : []
@@ -7163,7 +7195,7 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
 
   if (!scanState.clickedKeys) scanState.clickedKeys = {{}};
   const nowMs = Date.now();
-  const clickReady = nowMs - Number(scanState.lastCardClickAt || 0) >= 2500;
+  const clickReady = nowMs - Number(scanState.lastCardClickAt || 0) >= 700;
   if (PY_CLICK_CARDS && cardHits.length && clickReady) {{
     const next = cardHits.find(c => !PY_CLICKED_KEYS.has(c.key) && !scanState.clickedKeys[c.key]);
     if (next) {{
@@ -8712,6 +8744,9 @@ class ChromeBridge(threading.Thread):
         label = re.sub(r"\s+", " ", str(text or "")).strip()
         if not label:
             return fallback
+        low = label.lower()
+        if low.startswith(("http://", "https://")) or "client." in low or "/client" in low:
+            return fallback
         nums = re.findall(r"\b(?:[0-9]|[12][0-9]|3[0-6])\b", label)
         upper = label.upper()
         if len(nums) >= 8:
@@ -9778,24 +9813,31 @@ class ChromeBridge(threading.Thread):
 
         if self._is_collector_session(sid):
             self.table_scan_found_ids.add(table_id)
-            wait_seconds = (
-                TAB_WALK_TABLE_TIMEOUT_SECONDS
-                if self.table_scan_tab_walk
-                else 8.0
-            )
-            self.table_scan_click_deadlines[sid] = now + wait_seconds
-            if self.table_scan_tab_walk:
-                started = max([float(x or 0.0) for x in self.table_scan_click_started_at.values()] or [0.0])
-                self.table_scan_click_started_at.setdefault(sid, started or now)
-            with self.state.lock:
-                prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
-                self.state.table_scan_status = (
-                    f"{prefix}: tableId yakalandı • {table_id} • SON500/statisticHistory bekleniyor"
+            # V2.9.35: once the collector is back in the Pragmatic lobby, lobby
+            # preview/card API calls may still contain tableId. Do not recreate
+            # a table wait from those stale/lobby-preview requests; only extend
+            # the wait if a real card click is already in progress.
+            if self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                pass
+            else:
+                wait_seconds = (
+                    TAB_WALK_TABLE_TIMEOUT_SECONDS
+                    if self.table_scan_tab_walk
+                    else 8.0
                 )
-            probe_tid = self._target_id_for_session(sid)
-            if probe_tid in self.table_scan_probe_targets:
-                self.table_scan_probe_targets[probe_tid]["table_id_seen"] = table_id
-                self.table_scan_probe_targets[probe_tid]["table_seen_at"] = now
+                self.table_scan_click_deadlines[sid] = now + wait_seconds
+                if self.table_scan_tab_walk:
+                    started = max([float(x or 0.0) for x in self.table_scan_click_started_at.values()] or [0.0])
+                    self.table_scan_click_started_at.setdefault(sid, started or now)
+                with self.state.lock:
+                    prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+                    self.state.table_scan_status = (
+                        f"{prefix}: tableId yakalandı • {table_id} • sağ-alt SON500 paneli bekleniyor"
+                    )
+                probe_tid = self._target_id_for_session(sid)
+                if probe_tid in self.table_scan_probe_targets:
+                    self.table_scan_probe_targets[probe_tid]["table_id_seen"] = table_id
+                    self.table_scan_probe_targets[probe_tid]["table_seen_at"] = now
 
         old = self.session_table_activity.get(sid, {})
         hits = (
@@ -10215,7 +10257,7 @@ class ChromeBridge(threading.Thread):
                                 continue
 
                             scan_key = (sid, context_id)
-                            if now - float(last_table_nav_scan.get(scan_key, 0.0)) < 2.0:
+                            if now - float(last_table_nav_scan.get(scan_key, 0.0)) < (0.8 if self.table_scan_tab_walk else 2.0):
                                 continue
                             last_table_nav_scan[scan_key] = now
                             params = {
@@ -10818,6 +10860,8 @@ class ChromeBridge(threading.Thread):
             if sid_ctx and self._is_collector_session(sid_ctx):
                 if table_id:
                     self.table_scan_found_ids.add(table_id)
+                if self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                    return
                 if table_id and len(nums) >= 20:
                     display_name = self._clean_collector_label(
                         str(meta.get("title") or self.table_scan_last_clicked_label or table_id),
@@ -10890,13 +10934,19 @@ class ChromeBridge(threading.Thread):
             if sid_ctx and self._is_collector_session(sid_ctx):
                 if table_id:
                     self.table_scan_found_ids.add(table_id)
+                if self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                    return
                 if value.get("ok") and value.get("body") and table_id:
                     nums = extract_statistic_history(value.get("body"))
                     if len(nums) >= 20:
+                        display_name = self._clean_collector_label(
+                            title or self.table_scan_last_clicked_label or table_id,
+                            fallback=table_id,
+                        )
                         self.state.store_background_table_history(
                             nums,
                             table_id=table_id,
-                            display_name=title or self.table_scan_last_clicked_label,
+                            display_name=display_name,
                             source_label="CLICK SCAN statisticHistory",
                         )
                         self.state.mark_table_attempt(table_id, ok=True)
@@ -10914,7 +10964,7 @@ class ChromeBridge(threading.Thread):
                         with self.state.lock:
                             prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                             self.state.table_scan_status = (
-                                f"{prefix}: runtime SON500 kaydedildi • {(title or self.table_scan_last_clicked_label or table_id)[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
+                                f"{prefix}: runtime SON500 kaydedildi • {display_name[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
                             )
                     elif table_id:
                         # tableId arrived but usable SON500/statisticHistory has not
@@ -11347,11 +11397,27 @@ class ChromeBridge(threading.Thread):
                             or value.get("foundTab")
                             or str(value.get("source") or "") in ("auto-button", "son500-tab")
                         )
+                        sid_meta = str(meta.get("session") or "")
                         table_id, display_name = self._collector_table_identity(
-                            str(meta.get("session") or ""),
+                            sid_meta,
                             real_table_id=str(meta.get("real_table_id") or raw_table_id),
                             title=title,
                         ) if is_collector else (raw_table_id, title)
+                        if is_collector and bool(value.get("lobbyLike")):
+                            for scan_sid in list(self.session_info.keys()):
+                                if self._is_collector_session(scan_sid):
+                                    self.table_scan_click_deadlines.pop(scan_sid, None)
+                                    self.table_scan_click_started_at.pop(scan_sid, None)
+                                    self.session_table_activity.pop(scan_sid, None)
+                            self.table_scan_current_click_key = ""
+                            self.table_scan_current_click_label = ""
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: Pragmatic Rulet lobisine dönüldü • {int(value.get('lobbyCardCount',0) or 0)} kart • sıradaki masa seçiliyor"
+                                )
+                            return
+                        if is_collector and self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                            return
                         if len(nums) >= 20 and table_id and ((not is_collector) or panel_seen):
                             source_label = (
                                 "SEKMELİ TOPLA sağ-alt SON500 paneli"
@@ -11840,7 +11906,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.34 • Oyun İçi Lobi")
+        self.root.title("Roulette Pro AI V2.9.35 • Hızlı Lobi Devam")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12011,7 +12077,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.34 OYUN İÇİ LOBİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.35 HIZLI LOBİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
