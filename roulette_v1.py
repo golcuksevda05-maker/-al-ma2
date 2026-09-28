@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.36: skip tables without SON500.
-# Some roulette variants do not expose the lower-right SON 500 panel. The
-# collector now detects that condition, marks the table as skipped instead of
-# waiting until the full timeout, returns to lobby, and continues quickly.
+# V2.9.37: skip-without-sticking fix.
+# Some tables have no SON500 panel. When detected, mark the table as skipped,
+# clear the wait immediately, press the in-game Lobby button, and continue to
+# the next card instead of staying on "es geçiliyor".
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -11472,11 +11472,26 @@ class ChromeBridge(threading.Thread):
                                 key = str(self.table_scan_current_click_key or table_id)
                                 self.table_scan_probe_done.add(key)
                                 self.table_scan_probe_skip.add(key)
-                                self._schedule_collector_return(sid_meta, 0.8)
+                                return_sid = (
+                                    sid_meta
+                                    or next(iter(self.table_scan_click_deadlines.keys()), "")
+                                    or self._collector_root_session()
+                                )
                                 with self.state.lock:
                                     self.state.table_scan_status = (
                                         f"SEKMELİ TOPLA: SON500 yok • {display_name[:44]} • es geçiliyor"
                                     )
+                                # V2.9.37: do not merely schedule this return;
+                                # repeated DOM scans could keep refreshing the
+                                # due time and leave the UI stuck at
+                                # "es geçiliyor". Clear the wait and click the
+                                # in-game Lobby button immediately.
+                                self._return_collector_to_lobby(
+                                    return_sid,
+                                    "SON500 yok • es geçildi",
+                                )
+                                self.table_scan_current_click_key = ""
+                                self.table_scan_current_click_label = ""
                             else:
                                 with self.state.lock:
                                     if has_son500_tab:
@@ -11945,7 +11960,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.36 • SON500 Yoksa Atla")
+        self.root.title("Roulette Pro AI V2.9.37 • Atla ve Devam")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12116,7 +12131,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.36 SON500 ATLA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.37 ATLA DEVAM",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

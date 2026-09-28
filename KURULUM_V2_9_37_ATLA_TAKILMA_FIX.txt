@@ -1,0 +1,23 @@
+ROULETTE PRO AI V2.9.37 ATLA TAKILMA FIX KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.37 ATLA DEVAM yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+2. Program masaları tek yan sekmede gezmeye devam eder.
+3. SON500 olan masalarda veri kaydedilir.
+4. SON500 olmayan masalarda 'SON500 yok • es geçildi' diyerek hemen Lobi düğmesine basar ve sıradaki masaya geçer.
+
+500 SPİN KONTROLÜ
+- Programda VERİ DURUMU içinde 'PRAGMATIC DIRECT: 500/500' veya 'PRAGMATIC statisticHistory network: 500/500' görürsen veri çekilmiştir.
+- 'UZUN MASA ARŞİVİ: 500+' o masanın arşive yazıldığını gösterir.
+- 'MASA BANKALARINI GÖR' düğmesiyle tüm masa arşivlerini görebilirsin.
