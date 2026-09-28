@@ -1,0 +1,26 @@
+ROULETTE PRO AI V2.9.30 TEK SEKME TOPLAYICI KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.30 TEK SEKME yazmalı.
+
+KULLANIM
+1. Kendi oynadığın masa sekmesi açık kalabilir.
+2. Programda VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+3. Program yan tarafta tek collector sekmesi açar.
+4. Pragmatic Play Lobby kartına girer, Rulet lobisini açar.
+5. Masa kartlarını tek tek gerçek tıklama ile açar.
+6. Her masada SON500/statisticHistory bekler.
+7. Veri gelince kaydeder ve lobiye geri dönüp sıradaki masaya geçer.
+8. Tur bitince 5 dakika sonra tekrar eder.
+9. Durdurmak için TARAMAYI DURDUR'a bas.
+
+ÖNEMLİ
+- Bu sürümde amaç çok sekme açmak değil, tek yan sekmede masaları sırayla gezmektir.

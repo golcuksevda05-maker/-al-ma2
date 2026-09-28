@@ -29,10 +29,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.29: tab-walk waits for real SON500 data.
-# Sequential table tabs no longer close just because tableId appeared or an
-# early API attempt failed; they stay open until statisticHistory/SON500 is
-# captured or the per-table timeout expires.
+# V2.9.30: single collector-tab lobby walker.
+# The fallback collector no longer opens synthetic table URLs in extra tabs.
+# It keeps one side Chrome tab, actually clicks roulette tiles in the lobby,
+# waits for SON500/statisticHistory, then goes back and clicks the next tile.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -7498,6 +7498,8 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probed_keys = set()
         self.table_scan_clicked_keys = set()
         self.table_scan_click_deadlines = {}
+        self.table_scan_current_click_key = ""
+        self.table_scan_current_click_label = ""
         self.table_scan_last_clicked_label = ""
         for _tid, _row in (getattr(state, "table_registry", {}) or {}).items():
             self.collector_seen[str(_tid)] = {
@@ -8213,6 +8215,8 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_done = set()
         self.table_scan_probe_success = set()
         self.table_scan_probe_fail = set()
+        self.table_scan_current_click_key = ""
+        self.table_scan_current_click_label = ""
         self.table_scan_last_clicked_label = ""
         self.send(
             "Target.createTarget",
@@ -8268,7 +8272,7 @@ class ChromeBridge(threading.Thread):
         self.table_scan_next_cycle = 0.0
         self.table_scan_enabled = True
         return self._start_lobby_collector_target(
-            "SEKMELİ TOPLA: Pragmatic Play lobisi açılıyor • masalar sırayla sekmede gezilecek"
+            "TEK SEKME TOPLA: Pragmatic Play lobisi açılıyor • aynı yan sekmede masalar tek tek gezilecek"
         )
 
     def stop_table_scan(self, reason="kullanıcı durdurdu"):
@@ -8335,7 +8339,24 @@ class ChromeBridge(threading.Thread):
                         f"{prefix}: {reason} • sekme kapatılıyor"
                     )
             else:
-                self.send("Page.navigate", {"url": url}, session_id=sid)
+                if self.table_scan_tab_walk:
+                    back_js = (
+                        "(() => { try { if (history.length > 1) { history.back(); "
+                        "return 'back'; } location.href = "
+                        + json.dumps(url)
+                        + "; return 'nav'; } catch(e) { location.href = "
+                        + json.dumps(url)
+                        + "; return 'fallback'; } })()"
+                    )
+                    self.send(
+                        "Runtime.evaluate",
+                        {"expression": back_js, "returnByValue": True},
+                        session_id=sid,
+                        kind="collectorback",
+                        context={"session": sid},
+                    )
+                else:
+                    self.send("Page.navigate", {"url": url}, session_id=sid)
                 with self.state.lock:
                     prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                     self.state.table_scan_status = (
@@ -8909,7 +8930,9 @@ class ChromeBridge(threading.Thread):
             clicked_label = str(value.get("clickedLabel") or "").strip()
             if clicked_key:
                 self.table_scan_clicked_keys.add(clicked_key)
+                self.table_scan_current_click_key = clicked_key
             if clicked_label:
+                self.table_scan_current_click_label = clicked_label
                 self.table_scan_last_clicked_label = clicked_label
             for row in [r for r in (value.get("cards") or []) if isinstance(r, dict)]:
                 key = str(row.get("key") or "").strip()
@@ -8922,12 +8945,17 @@ class ChromeBridge(threading.Thread):
                         "table_id": table_id,
                         "display_name": str(row.get("label") or table_id),
                     }], source="PRAGMATIC LOBI KARTI")
-            self.table_scan_click_deadlines[sid] = now + COLLECTOR_CARD_CLICK_SECONDS
+            wait_seconds = (
+                TAB_WALK_TABLE_TIMEOUT_SECONDS
+                if self.table_scan_tab_walk
+                else COLLECTOR_CARD_CLICK_SECONDS
+            )
+            self.table_scan_click_deadlines[sid] = now + wait_seconds
             with self.state.lock:
                 self.state.table_scan_status = (
-                    "MASA TARAMA: masa kartı açıldı • "
+                    f"{prefix}: masa kartı tıklandı • "
                     + (clicked_label[:60] if clicked_label else "veri bekleniyor")
-                    + " • veri/SON500 bekleniyor"
+                    + " • SON500/statisticHistory bekleniyor"
                 )
             return
 
@@ -8950,10 +8978,7 @@ class ChromeBridge(threading.Thread):
                     "table_id": table_id,
                     "display_name": str(row.get("label") or table_id),
                 }], source="PRAGMATIC LOBI KARTI")
-            if self.table_scan_tab_walk:
-                if self._queue_table_probe(row):
-                    queued_probes += 1
-            elif not table_id and self._queue_table_probe(row):
+            if (not self.table_scan_tab_walk) and (not table_id) and self._queue_table_probe(row):
                 queued_probes += 1
 
         if queued_probes:
@@ -8980,7 +9005,7 @@ class ChromeBridge(threading.Thread):
         probe_active = len(self.table_scan_probe_targets)
         probe_waiting = len(self.table_scan_probe_queue)
         scan_id_count = len(self.table_scan_found_ids)
-        remaining_clicks = 0 if self.table_scan_tab_walk else max(0, len(self.table_scan_visited) - len(self.table_scan_clicked_keys))
+        remaining_clicks = max(0, len(self.table_scan_visited) - len(self.table_scan_clicked_keys))
         with self.state.lock:
             bank_count = len(self.state.table_registry)
         if (
@@ -9008,8 +9033,9 @@ class ChromeBridge(threading.Thread):
             done_count = len(self.table_scan_probe_done)
             ok_count = len(self.table_scan_probe_success)
             fail_count = len(self.table_scan_probe_fail)
+            waiting = bool(self.table_scan_click_deadlines)
             probe_text = (
-                f"sekme {probe_active}/{active_limit} aktif {probe_waiting} kuyruk • "
+                f"tek yan sekme • {'masada veri bekliyor' if waiting else f'kalan {remaining_clicks} kart'} • "
                 f"tamam {done_count} OK {ok_count} hata {fail_count} • "
             )
         else:
@@ -9462,13 +9488,16 @@ class ChromeBridge(threading.Thread):
                         if due and now >= due:
                             if self.table_scan_tab_walk:
                                 probe_tid = self._target_id_for_session(sid)
+                                key = str(self.table_scan_current_click_key or probe_tid or sid)
                                 if probe_tid in self.table_scan_probe_targets:
                                     row = self.table_scan_probe_targets[probe_tid]
-                                    key = str(row.get("key") or probe_tid)
-                                    if key not in self.table_scan_probe_success:
-                                        self.table_scan_probe_done.add(key)
-                                        self.table_scan_probe_fail.add(key)
-                                        row["done_at"] = now
+                                    key = str(row.get("key") or key)
+                                    row["done_at"] = now
+                                if key not in self.table_scan_probe_success:
+                                    self.table_scan_probe_done.add(key)
+                                    self.table_scan_probe_fail.add(key)
+                                self.table_scan_current_click_key = ""
+                                self.table_scan_current_click_label = ""
                                 self._return_collector_to_lobby(sid, "veri zaman aşımı")
                             else:
                                 self._return_collector_to_lobby(sid, "masa denemesi tamamlandı")
@@ -9645,6 +9674,9 @@ class ChromeBridge(threading.Thread):
                                     },
                                 )
 
+                            if self.table_scan_tab_walk and self.table_scan_click_deadlines:
+                                continue
+
                             scan_key = (sid, context_id)
                             if now - float(last_table_nav_scan.get(scan_key, 0.0)) < 2.0:
                                 continue
@@ -9652,7 +9684,7 @@ class ChromeBridge(threading.Thread):
                             params = {
                                 "expression": build_multi_table_nav_scan(
                                     self.table_scan_clicked_keys,
-                                    click_cards=not bool(self.table_scan_tab_walk),
+                                    click_cards=True,
                                 ),
                                 "returnByValue": True,
                                 "awaitPromise": True,
@@ -10260,8 +10292,10 @@ class ChromeBridge(threading.Thread):
                         row["done_at"] = now_done
                         row["table_id_seen"] = table_id
                         key = str(row.get("key") or probe_tid)
-                        self.table_scan_probe_done.add(key)
-                        self.table_scan_probe_success.add(key)
+                    else:
+                        key = str(self.table_scan_current_click_key or sid_ctx)
+                    self.table_scan_probe_done.add(key)
+                    self.table_scan_probe_success.add(key)
                     with self.state.lock:
                         prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                         self.state.table_scan_status = (
@@ -10327,8 +10361,10 @@ class ChromeBridge(threading.Thread):
                             row = self.table_scan_probe_targets[probe_tid]
                             row["done_at"] = now_done
                             key = str(row.get("key") or probe_tid)
-                            self.table_scan_probe_done.add(key)
-                            self.table_scan_probe_success.add(key)
+                        else:
+                            key = str(self.table_scan_current_click_key or sid_ctx)
+                        self.table_scan_probe_done.add(key)
+                        self.table_scan_probe_success.add(key)
                         with self.state.lock:
                             prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
                             self.state.table_scan_status = (
@@ -11158,7 +11194,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.29 • Sekme Veri Bekle")
+        self.root.title("Roulette Pro AI V2.9.30 • Tek Sekme Toplayıcı")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -11329,7 +11365,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.29 VERİ BEKLE",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.30 TEK SEKME",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -11575,7 +11611,7 @@ class App:
         tabwalk_bar=tk.Frame(data,bg=self.PANEL)
         tabwalk_bar.pack(fill="x",padx=8,pady=(0,5))
         tk.Button(
-            tabwalk_bar,text="SEKMELİ LOBİ TOPLA • 5 DK",command=self.start_tab_walk_scan_ui,
+            tabwalk_bar,text="TEK SEKME LOBİ TOPLA • 5 DK",command=self.start_tab_walk_scan_ui,
             font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.BLUE,
             activebackground=self.PANEL2,activeforeground=self.GREEN,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
