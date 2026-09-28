@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.39: lock active table before lobby scanning.
-# If the collector is visibly inside a roulette table, it must not be
-# misclassified as the roulette lobby. Tables with SON500 are locked for
-# panel reading; tables without SON500 are skipped immediately.
+# V2.9.40: block hot/cold-only tables.
+# Tables such as PowerUp Rulet can expose only the Sıcak & Soğuk stats panel
+# instead of SON500. The collector skips those UI/table names immediately and
+# prevents future clicks from the lobby scan.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -44,6 +44,10 @@ TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
 TAB_WALK_TABLE_MIN_DWELL_SECONDS = 4.0
 TAB_WALK_NO_SON500_SKIP_SECONDS = 6.0
 TAB_WALK_EMPTY_SON500_SKIP_SECONDS = 12.0
+TAB_WALK_BLOCKED_TABLE_LABELS = (
+    "POWERUP RULET", "POWERUP ROULETTE", "POWERUP ROULET",
+    "POWER UP RULET", "POWER UP ROULETTE", "POWER UP ROULET",
+)
 DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
 DGA_DEFAULT_CURRENCY = "TRY"
@@ -6728,10 +6732,24 @@ HISTORY500_SCAN = r"""
     }
   } catch (_) {}
   const bodyT = norm(readableText(document.body || document.documentElement));
+  const titleT = norm(document.title || '');
   const lobbyLike = !autoFound && !best && (
     lobbyCardCount >= 3 ||
     (/\bRULET\b|\bROULETTE\b/.test(bodyT) && /STANDART|TURKCE|TÜRKÇE|HIZLI|PRIVE|PRIVÉ|VERSIYON/.test(bodyT) && lobbyCardCount >= 1)
   );
+  const hasInGameLobbyButton = all.some(el => {
+    try {
+      if (!visibleStyle(el)) return false;
+      const r = el.getBoundingClientRect();
+      const t = norm([readableText(el), el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title')].join(' '));
+      return /\b(LOBI|LOBBY)\b/.test(t) && r.top <= innerHeight * 0.24 && r.left >= innerWidth * 0.50;
+    } catch (_) { return false; }
+  });
+  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS/.test(bodyT);
+  const hasHotColdPanel = /SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD/.test(bodyT);
+  const blockedTable = /POWER\s*UP\s*(RULET|ROULETTE|ROULET)?|POWERUP\s*(RULET|ROULETTE|ROULET)?/.test(titleT + ' ' + bodyT);
+  const hotColdOnly = hasInGameLobbyButton && activeGameUi && hasHotColdPanel && !tab;
+  const gameNoSon500 = blockedTable || hotColdOnly;
 
   return {
     title: document.title,
@@ -6741,6 +6759,9 @@ HISTORY500_SCAN = r"""
     autoFound,
     lobbyLike,
     lobbyCardCount,
+    blockedTable,
+    hotColdOnly,
+    gameNoSon500,
     source: best ? (best.source || '') : '',
     count: best ? best.nums.length : 0,
     nums: best ? best.nums.slice(0, 500) : []
@@ -6888,12 +6909,21 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
         [str(x) for x in list(clicked_keys or [])[:2500]],
         ensure_ascii=False,
     )
+    blocked_json = json.dumps(
+        [str(x) for x in TAB_WALK_BLOCKED_TABLE_LABELS],
+        ensure_ascii=False,
+    )
     click_cards_json = json.dumps(bool(click_cards))
     return rf"""
 (() => {{
   const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[İı]/g, 'I').replace(/\s+/g, ' ').trim().toUpperCase();
   const PY_CLICKED_KEYS = new Set({clicked_json});
+  const PY_BLOCKED_TABLE_LABELS = {blocked_json};
+  const blockedLabel = s => {{
+    const t = norm(s || '');
+    return PY_BLOCKED_TABLE_LABELS.some(b => b && t.includes(b));
+  }};
   const PY_CLICK_CARDS = {click_cards_json};
   const visible = el => {{
     if (!el) return false;
@@ -7035,8 +7065,18 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     ].join(' '));
     return /\b(LOBI|LOBBY)\b/.test(t) && r.top <= innerHeight * 0.24 && r.left >= innerWidth * 0.50;
   }});
-  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS/.test(bodyText);
+  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS/.test(bodyText);
+  const blockedActiveTable = blockedLabel(title + ' ' + bodyText);
   if (hasInGameLobbyButton && activeGameUi) {{
+    if (blockedActiveTable) {{
+      return {{
+        ok:true,
+        mode:'game_blocked',
+        stage:'active-game-blocked',
+        title,url:href,
+        reason:'bloklu masa'
+      }};
+    }}
     if (!hasSon500Control) {{
       return {{
         ok:true,
@@ -7198,6 +7238,7 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     ].join(' '));
     const textLooksRoulette=/(ROULETTE|RULET)/.test(text);
     if ((!text && !tableId && !gameId) || text.length>520) continue;
+    if (blockedLabel(text)) continue;
     if (!textLooksRoulette && !(rouletteContext && (tableId || gameId))) continue;
     if (badCardText.test(text)) continue;
     if (categoryLabels.has(text)) continue;
@@ -7209,6 +7250,7 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
       hit.getAttribute && hit.getAttribute('aria-label'),
       hit.getAttribute && hit.getAttribute('title')
     ].join(' ')).slice(0,260);
+    if (blockedLabel(label)) continue;
     if (!/(ROULETTE|RULET)/.test(label) && !(rouletteContext && (gameId || tableId))) continue;
     if (badCardText.test(label)) continue;
 
@@ -8788,6 +8830,12 @@ class ChromeBridge(threading.Thread):
                 self.state.table_scan_status = f"MASA TARAMA/API ÖĞREN: durdu • {reason}"
         return True
 
+    def _is_blocked_table_label(self, text):
+        up = str(text or "").upper()
+        if not up:
+            return False
+        return any(str(x or "").upper() in up for x in TAB_WALK_BLOCKED_TABLE_LABELS)
+
     def _clean_collector_label(self, text, fallback="Roulette"):
         label = re.sub(r"\s+", " ", str(text or "")).strip()
         if not label:
@@ -9449,7 +9497,7 @@ class ChromeBridge(threading.Thread):
 
         prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
 
-        if mode == "game_no_son500":
+        if mode in ("game_no_son500", "game_blocked"):
             key = str(self.table_scan_current_click_key or self.table_scan_last_clicked_label or sid)
             if key:
                 self.table_scan_probe_done.add(key)
@@ -9460,11 +9508,12 @@ class ChromeBridge(threading.Thread):
                 or str(value.get("title") or "Roulette"),
                 fallback="Roulette",
             )
+            reason = "bloklu masa" if mode == "game_blocked" else "SON500 paneli yok"
             with self.state.lock:
                 self.state.table_scan_status = (
-                    f"{prefix}: SON500 paneli yok • {label[:44]} • anında es geçiliyor"
+                    f"{prefix}: {reason} • {label[:44]} • anında es geçiliyor"
                 )
-            self._return_collector_to_lobby(sid, "SON500 paneli yok • es geçildi")
+            self._return_collector_to_lobby(sid, f"{reason} • es geçildi")
             self.table_scan_current_click_key = ""
             self.table_scan_current_click_label = ""
             return
@@ -11496,6 +11545,43 @@ class ChromeBridge(threading.Thread):
                             real_table_id=str(meta.get("real_table_id") or raw_table_id),
                             title=title,
                         ) if is_collector else (raw_table_id, title)
+                        blocked_or_no_son500 = bool(
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and self.table_scan_click_deadlines
+                            and (
+                                value.get("blockedTable")
+                                or value.get("gameNoSon500")
+                                or value.get("hotColdOnly")
+                                or self._is_blocked_table_label(display_name)
+                                or self._is_blocked_table_label(self.table_scan_current_click_label)
+                                or self._is_blocked_table_label(self.table_scan_last_clicked_label)
+                            )
+                        )
+                        if blocked_or_no_son500:
+                            key = str(self.table_scan_current_click_key or table_id or sid_meta)
+                            if key:
+                                self.table_scan_probe_done.add(key)
+                                self.table_scan_probe_skip.add(key)
+                            return_sid = (
+                                sid_meta
+                                or next(iter(self.table_scan_click_deadlines.keys()), "")
+                                or self._collector_root_session()
+                            )
+                            reason = "bloklu masa" if (
+                                value.get("blockedTable")
+                                or self._is_blocked_table_label(display_name)
+                                or self._is_blocked_table_label(self.table_scan_current_click_label)
+                                or self._is_blocked_table_label(self.table_scan_last_clicked_label)
+                            ) else "SON500 paneli yok"
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: {reason} • {display_name[:44]} • anında es geçiliyor"
+                                )
+                            self._return_collector_to_lobby(return_sid, f"{reason} • es geçildi")
+                            self.table_scan_current_click_key = ""
+                            self.table_scan_current_click_label = ""
+                            return
                         if is_collector and bool(value.get("lobbyLike")):
                             for scan_sid in list(self.session_info.keys()):
                                 if self._is_collector_session(scan_sid):
@@ -12043,7 +12129,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.39 • Masa Kilit SON500")
+        self.root.title("Roulette Pro AI V2.9.40 • Bloklu Masa Atla")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12214,7 +12300,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.39 MASA KİLİT",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.40 BLOK ATLA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
