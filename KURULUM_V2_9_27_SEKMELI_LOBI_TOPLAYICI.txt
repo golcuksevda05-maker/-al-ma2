@@ -1,0 +1,26 @@
+ROULETTE PRO AI V2.9.27 SEKMELİ LOBİ TOPLAYICI KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.27 SEKMELİ TOPLA yazmalı.
+
+KULLANIM
+1. Chrome'da Pragmatic Play lobisi veya bir Pragmatic rulet masası açık olsun.
+2. VERİ panelindeki yeni düğmeye bas:
+   SEKMELİ LOBİ TOPLA • 5 DK
+3. Program lobi içindeki rulet masalarını bulup sırayla ayrı Chrome sekmesinde açar.
+4. Her masada SON500/statisticHistory verisini bekler.
+5. Veri alınca sekmeyi kapatıp sıradaki masaya geçer.
+6. Tur bitince 5 dakika sonra otomatik tekrar eder.
+7. Durdurmak için TARAMAYI DURDUR'a bas.
+
+ÖNEMLİ
+- DGA CANLI / MASALARI TARA düğmesi DGA/live feed denemesidir.
+- Masa masa gerçek sekme gezme için yeni düğmeyi kullan:
+  SEKMELİ LOBİ TOPLA • 5 DK
