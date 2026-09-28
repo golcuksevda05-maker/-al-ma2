@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.40: block hot/cold-only tables.
-# Tables such as PowerUp Rulet can expose only the Sıcak & Soğuk stats panel
-# instead of SON500. The collector skips those UI/table names immediately and
-# prevents future clicks from the lobby scan.
+# V2.9.41: keep table locked until SON500 read.
+# Some operators keep the roulette lobby DOM behind the open table. The
+# collector now prioritizes visible game/SON500 controls over lobby cards and
+# continues HISTORY500 reads even if the old wait flag was cleared.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -7043,9 +7043,10 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     'button,a,[role="button"],[tabindex],div,span'
   )).filter(visible);
 
-  // V2.9.39: if we are clearly inside the game UI, stop before the
-  // generic lobby/card scanner. With SON500 visible, Python must read it;
-  // without SON500, Python skips the table immediately.
+  // V2.9.41: if a real game overlay is visible, stop before the
+  // generic lobby/card scanner. Some operators keep the lobby DOM behind the
+  // table; the presence of visible SON500 or the in-game Lobi button is more
+  // important than stale lobby cards.
   const hasSon500Control = visibleControls.some(el => {{
     const t = norm([
       el.innerText, el.textContent,
@@ -7063,11 +7064,12 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
       el.getAttribute && el.getAttribute('title'),
       el.getAttribute && el.getAttribute('data-testid')
     ].join(' '));
-    return /\b(LOBI|LOBBY)\b/.test(t) && r.top <= innerHeight * 0.24 && r.left >= innerWidth * 0.50;
+    return /\b(LOBI|LOBBY)\b/.test(t) && r.top <= innerHeight * 0.28 && r.left >= innerWidth * 0.45;
   }});
-  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS/.test(bodyText);
+  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS|OTOMATIK\s+OYUN|AUTOMATIC\s+PLAY/.test(bodyText);
   const blockedActiveTable = blockedLabel(title + ' ' + bodyText);
-  if (hasInGameLobbyButton && activeGameUi) {{
+  const gameOverlayLikely = hasInGameLobbyButton || (hasSon500Control && /BAKIYE|BALANCE|OTOMATIK|AUTOMATIC|BAHIS|BET|SICAK|HOT|VOISINS|TIERS|ORPHELINS|JEU/.test(bodyText));
+  if (gameOverlayLikely) {{
     if (blockedActiveTable) {{
       return {{
         ok:true,
@@ -7077,7 +7079,16 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
         reason:'bloklu masa'
       }};
     }}
-    if (!hasSon500Control) {{
+    if (hasSon500Control) {{
+      return {{
+        ok:true,
+        mode:'game_has_son500',
+        stage:'active-game-has-son500',
+        title,url:href,
+        reason:'SON500 paneli var'
+      }};
+    }}
+    if (activeGameUi) {{
       return {{
         ok:true,
         mode:'game_no_son500',
@@ -7086,13 +7097,6 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
         reason:'SON500 paneli yok'
       }};
     }}
-    return {{
-      ok:true,
-      mode:'game_has_son500',
-      stage:'active-game-has-son500',
-      title,url:href,
-      reason:'SON500 paneli var'
-    }};
   }}
 
   const categoryLabels=new Set(['RULET','ROULETTE','RULET MASALARI','ROULETTE TABLES']);
@@ -9532,6 +9536,39 @@ class ChromeBridge(threading.Thread):
                 or str(value.get("title") or "Roulette"),
                 fallback="Roulette",
             )
+            try:
+                collector_tid = str(
+                    (self.session_table_activity.get(sid, {}) or {}).get("table_id", "")
+                    or ""
+                )
+                fallback_tid, fallback_title = self._collector_table_identity(
+                    sid,
+                    real_table_id=collector_tid,
+                    title=label,
+                )
+                params = {
+                    "expression": HISTORY500_SCAN,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                }
+                context_id = meta.get("context_id")
+                if context_id is not None:
+                    params["contextId"] = int(context_id)
+                self.send(
+                    "Runtime.evaluate",
+                    params,
+                    session_id=sid,
+                    kind="background500",
+                    context={
+                        "session": sid,
+                        "table_id": fallback_tid,
+                        "real_table_id": collector_tid,
+                        "title": fallback_title,
+                        "collector": True,
+                    },
+                )
+            except Exception:
+                pass
             with self.state.lock:
                 self.state.table_scan_status = (
                     f"{prefix}: masa açık • SON500 paneli görüldü • {label[:44]} • 500 spin okunuyor"
@@ -10370,9 +10407,9 @@ class ChromeBridge(threading.Thread):
                                     or self.table_scan_current_click_label
                                 ),
                             )
-                            if self.table_scan_tab_walk and self.table_scan_click_deadlines:
+                            if self.table_scan_tab_walk and (self.table_scan_click_deadlines or collector_tid or self._is_collector_session(sid)):
                                 hist_key = (sid, context_id, "collector_history500")
-                                if now - float(last_500_scan.get(hist_key, 0.0)) >= 1.8:
+                                if now - float(last_500_scan.get(hist_key, 0.0)) >= 1.4:
                                     last_500_scan[hist_key] = now
                                     hist_params = {
                                         "expression": HISTORY500_SCAN,
@@ -11595,7 +11632,18 @@ class ChromeBridge(threading.Thread):
                                     f"SEKMELİ TOPLA: Pragmatic Rulet lobisine dönüldü • {int(value.get('lobbyCardCount',0) or 0)} kart • sıradaki masa seçiliyor"
                                 )
                             return
-                        if is_collector and self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                        if (
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and not self.table_scan_click_deadlines
+                            and not (
+                                panel_seen
+                                or value.get("gameNoSon500")
+                                or value.get("blockedTable")
+                                or value.get("hotColdOnly")
+                                or value.get("foundTab")
+                            )
+                        ):
                             return
                         if len(nums) >= 20 and table_id and ((not is_collector) or panel_seen):
                             source_label = (
@@ -12129,7 +12177,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.40 • Bloklu Masa Atla")
+        self.root.title("Roulette Pro AI V2.9.41 • SON500 Kilit Oku")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12300,7 +12348,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.40 BLOK ATLA",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.41 KİLİT OKU",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
