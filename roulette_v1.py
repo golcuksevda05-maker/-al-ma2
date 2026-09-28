@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.41: keep table locked until SON500 read.
-# Some operators keep the roulette lobby DOM behind the open table. The
-# collector now prioritizes visible game/SON500 controls over lobby cards and
-# continues HISTORY500 reads even if the old wait flag was cleared.
+# V2.9.42: finish lobby pass after return and ignore stale game frames.
+# After pressing the in-game Lobi button, some old Pragmatic game iframes still
+# report SON500/Lobi controls while the visible root page is already back in the
+# roulette lobby. A short return grace lets the real lobby scan take priority.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -44,6 +44,7 @@ TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
 TAB_WALK_TABLE_MIN_DWELL_SECONDS = 4.0
 TAB_WALK_NO_SON500_SKIP_SECONDS = 6.0
 TAB_WALK_EMPTY_SON500_SKIP_SECONDS = 12.0
+TAB_WALK_RETURN_GRACE_SECONDS = 12.0
 TAB_WALK_BLOCKED_TABLE_LABELS = (
     "POWERUP RULET", "POWERUP ROULETTE", "POWERUP ROULET",
     "POWER UP RULET", "POWER UP ROULETTE", "POWER UP ROULET",
@@ -7043,7 +7044,7 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     'button,a,[role="button"],[tabindex],div,span'
   )).filter(visible);
 
-  // V2.9.41: if a real game overlay is visible, stop before the
+  // V2.9.42: if a real game overlay is visible, stop before the
   // generic lobby/card scanner. Some operators keep the lobby DOM behind the
   // table; the presence of visible SON500 or the in-game Lobi button is more
   // important than stale lobby cards.
@@ -7359,6 +7360,7 @@ def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
     stage:category?(categoryState==='selected'?'roulette-selected':'roulette-unconfirmed'):'scanning',
     cards,
     scrollTop,scrollHeight,clientHeight,atBottom,
+    atBottomSeen: !!scanState.atBottomSeen,
     bodyLength:bodyText.length,
     title,url:href
   }};
@@ -8004,6 +8006,8 @@ class ChromeBridge(threading.Thread):
         self.table_scan_current_click_key = ""
         self.table_scan_current_click_label = ""
         self.table_scan_last_clicked_label = ""
+        self.table_scan_returning_until = 0.0
+        self.table_scan_lobby_seen_at = 0.0
         for _tid, _row in (getattr(state, "table_registry", {}) or {}).items():
             self.collector_seen[str(_tid)] = {
                 "table_id": str(_tid),
@@ -8702,6 +8706,8 @@ class ChromeBridge(threading.Thread):
         self.table_scan_probe_skip = set()
         self.table_scan_click_deadlines = {}
         self.table_scan_click_started_at = {}
+        self.table_scan_returning_until = 0.0
+        self.table_scan_lobby_seen_at = 0.0
         if self.ws is not None:
             for tid in tids:
                 try:
@@ -8731,6 +8737,8 @@ class ChromeBridge(threading.Thread):
         self.table_scan_current_click_key = ""
         self.table_scan_current_click_label = ""
         self.table_scan_last_clicked_label = ""
+        self.table_scan_returning_until = 0.0
+        self.table_scan_lobby_seen_at = 0.0
         self.send(
             "Target.createTarget",
             {
@@ -8914,6 +8922,17 @@ class ChromeBridge(threading.Thread):
         if not sid or self.ws is None:
             return False
         url = str(self.table_scan_entry_url or self._collector_launch_url() or "")
+        now = time.time()
+        if self.table_scan_tab_walk:
+            # V2.9.42: once we have intentionally pressed in-game Lobi, the old
+            # game iframe can keep reporting SON500/Lobi controls for a few
+            # seconds even though the visible root page is already the lobby.
+            # During this grace window the lobby scanner is allowed to win and
+            # stale game detections must not recreate a table wait.
+            self.table_scan_returning_until = max(
+                float(getattr(self, "table_scan_returning_until", 0.0) or 0.0),
+                now + TAB_WALK_RETURN_GRACE_SECONDS,
+            )
         self.table_scan_click_deadlines.pop(sid, None)
         self.table_scan_click_started_at.pop(sid, None)
         tid = self._target_id_for_session(sid)
@@ -8928,6 +8947,10 @@ class ChromeBridge(threading.Thread):
                     if self._is_collector_session(scan_sid):
                         self.table_scan_click_deadlines.pop(scan_sid, None)
                         self.table_scan_click_started_at.pop(scan_sid, None)
+                        self.session_table_activity.pop(scan_sid, None)
+                for scan_sid in list(self.session_info.keys()):
+                    if self._is_collector_session(scan_sid):
+                        self.session_table_activity.pop(scan_sid, None)
                 root_sid = self._collector_root_session() or sid
                 return_sids = []
                 for candidate in (sid, root_sid):
@@ -9500,6 +9523,21 @@ class ChromeBridge(threading.Thread):
             self.table_scan_last_view = now
 
         prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+        returning_to_lobby = bool(
+            self.table_scan_tab_walk
+            and float(getattr(self, "table_scan_returning_until", 0.0) or 0.0) > now
+        )
+        recent_lobby_visible = bool(
+            self.table_scan_tab_walk
+            and not self.table_scan_current_click_key
+            and float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0)
+            and now - float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0) <= 30.0
+        )
+        if (returning_to_lobby or recent_lobby_visible) and mode in ("game_has_son500", "game_no_son500", "game_blocked"):
+            # V2.9.42: ignore stale child game frames just after we pressed the
+            # in-game Lobi button or after the root page has already shown real
+            # lobby cards. The visible lobby scan will continue/finish the pass.
+            return
 
         if mode in ("game_no_son500", "game_blocked"):
             key = str(self.table_scan_current_click_key or self.table_scan_last_clicked_label or sid)
@@ -9606,6 +9644,8 @@ class ChromeBridge(threading.Thread):
             return
 
         if mode == "card_clicked":
+            self.table_scan_returning_until = 0.0
+            self.table_scan_lobby_seen_at = 0.0
             clicked_key = str(value.get("clickedKey") or "").strip()
             clicked_label = str(value.get("clickedLabel") or "").strip()
             if clicked_key:
@@ -9651,6 +9691,17 @@ class ChromeBridge(threading.Thread):
             return
 
         cards = [row for row in (value.get("cards") or []) if isinstance(row, dict)]
+        if self.table_scan_tab_walk and cards:
+            self.table_scan_lobby_seen_at = now
+            if returning_to_lobby or self.table_scan_click_deadlines:
+                self.table_scan_returning_until = 0.0
+                for scan_sid in list(self.session_info.keys()):
+                    if self._is_collector_session(scan_sid):
+                        self.table_scan_click_deadlines.pop(scan_sid, None)
+                        self.table_scan_click_started_at.pop(scan_sid, None)
+                        self.session_table_activity.pop(scan_sid, None)
+                self.table_scan_current_click_key = ""
+                self.table_scan_current_click_label = ""
         before = len(self.table_scan_visited)
         queued_probes = 0
         for row in cards:
@@ -9680,11 +9731,12 @@ class ChromeBridge(threading.Thread):
         except (TypeError, ValueError):
             scroll_height = scroll_top = client_height = 0
         at_bottom = bool(value.get("atBottom", True))
+        bottom_seen_once = bool(value.get("atBottomSeen", False))
 
         if scroll_height != self.table_scan_last_scroll_height:
             self.table_scan_last_scroll_height = scroll_height
             self.table_scan_no_progress = 0
-        elif at_bottom and new_cards == 0 and self.table_scan_visited:
+        elif (at_bottom or bottom_seen_once) and new_cards == 0 and self.table_scan_visited:
             self.table_scan_no_progress += 1
         else:
             self.table_scan_no_progress = 0
@@ -9697,8 +9749,8 @@ class ChromeBridge(threading.Thread):
         with self.state.lock:
             bank_count = len(self.state.table_registry)
         if (
-            at_bottom
-            and self.table_scan_no_progress >= 5
+            (at_bottom or bottom_seen_once)
+            and self.table_scan_no_progress >= 3
             and probe_active == 0
             and probe_waiting == 0
             and remaining_clicks <= 0
@@ -10358,6 +10410,10 @@ class ChromeBridge(threading.Thread):
                         # Preserve order while removing duplicate context ids.
                         scan_contexts = list(dict.fromkeys(scan_contexts))
                         for context_id in scan_contexts:
+                            returning_to_lobby = bool(
+                                self.table_scan_tab_walk
+                                and float(getattr(self, "table_scan_returning_until", 0.0) or 0.0) > now
+                            )
                             wait_started = max(
                                 [float(x or 0.0) for x in self.table_scan_click_started_at.values()] or [0.0]
                             )
@@ -10366,6 +10422,7 @@ class ChromeBridge(threading.Thread):
                                 and self.table_scan_click_deadlines
                                 and wait_started
                                 and now - wait_started < 8.0
+                                and not returning_to_lobby
                             )
                             direct_key = (sid, context_id, "collector_direct")
                             if (not skip_runtime_direct) and now - float(last_direct_scan.get(direct_key, 0.0)) >= 2.0:
@@ -10407,7 +10464,12 @@ class ChromeBridge(threading.Thread):
                                     or self.table_scan_current_click_label
                                 ),
                             )
-                            if self.table_scan_tab_walk and (self.table_scan_click_deadlines or collector_tid or self._is_collector_session(sid)):
+                            history_active = bool(
+                                self.table_scan_click_deadlines
+                                or self.table_scan_current_click_key
+                                or collector_tid
+                            )
+                            if self.table_scan_tab_walk and history_active and not returning_to_lobby:
                                 hist_key = (sid, context_id, "collector_history500")
                                 if now - float(last_500_scan.get(hist_key, 0.0)) >= 1.4:
                                     last_500_scan[hist_key] = now
@@ -10432,7 +10494,11 @@ class ChromeBridge(threading.Thread):
                                         },
                                     )
 
-                            if self.table_scan_tab_walk and self.table_scan_click_deadlines:
+                            if (
+                                self.table_scan_tab_walk
+                                and self.table_scan_click_deadlines
+                                and not returning_to_lobby
+                            ):
                                 continue
 
                             scan_key = (sid, context_id)
@@ -11490,7 +11556,18 @@ class ChromeBridge(threading.Thread):
                         stage = str(value.get("stage") or "")
                         clicked = bool(value.get("clicked"))
                         if clicked:
-                            self.table_scan_last_view = time.time()
+                            now_back = time.time()
+                            self.table_scan_last_view = now_back
+                            if self.table_scan_tab_walk:
+                                self.table_scan_returning_until = max(
+                                    float(getattr(self, "table_scan_returning_until", 0.0) or 0.0),
+                                    now_back + TAB_WALK_RETURN_GRACE_SECONDS,
+                                )
+                                for scan_sid in list(self.session_info.keys()):
+                                    if self._is_collector_session(scan_sid):
+                                        self.table_scan_click_deadlines.pop(scan_sid, None)
+                                        self.table_scan_click_started_at.pop(scan_sid, None)
+                                        self.session_table_activity.pop(scan_sid, None)
                             with self.state.lock:
                                 self.state.table_scan_status = (
                                     "SEKMELİ TOPLA: oyun içi Lobi düğmesi tıklandı • Pragmatic Rulet lobisi bekleniyor"
@@ -11582,6 +11659,21 @@ class ChromeBridge(threading.Thread):
                             real_table_id=str(meta.get("real_table_id") or raw_table_id),
                             title=title,
                         ) if is_collector else (raw_table_id, title)
+                        now_value = time.time()
+                        returning_to_lobby = bool(
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and float(getattr(self, "table_scan_returning_until", 0.0) or 0.0) > now_value
+                        )
+                        recent_lobby_visible = bool(
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and not self.table_scan_current_click_key
+                            and float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0)
+                            and now_value - float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0) <= 30.0
+                        )
+                        if (returning_to_lobby or recent_lobby_visible) and not bool(value.get("lobbyLike")):
+                            return
                         blocked_or_no_son500 = bool(
                             is_collector
                             and self.table_scan_tab_walk
@@ -11620,6 +11712,8 @@ class ChromeBridge(threading.Thread):
                             self.table_scan_current_click_label = ""
                             return
                         if is_collector and bool(value.get("lobbyLike")):
+                            self.table_scan_returning_until = 0.0
+                            self.table_scan_lobby_seen_at = time.time()
                             for scan_sid in list(self.session_info.keys()):
                                 if self._is_collector_session(scan_sid):
                                     self.table_scan_click_deadlines.pop(scan_sid, None)
@@ -12177,7 +12271,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.41 • SON500 Kilit Oku")
+        self.root.title("Roulette Pro AI V2.9.42 • Lobi Bitti Düzeltme")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12348,7 +12442,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.41 KİLİT OKU",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.42 LOBİ BİTTİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
