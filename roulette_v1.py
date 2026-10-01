@@ -30,10 +30,10 @@ PRAGMATIC_LOBBY_SCAN_URL = (
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
-# V2.9.42: finish lobby pass after return and ignore stale game frames.
-# After pressing the in-game Lobi button, some old Pragmatic game iframes still
-# report SON500/Lobi controls while the visible root page is already back in the
-# roulette lobby. A short return grace lets the real lobby scan take priority.
+# V2.9.43: local AI decision engine.
+# The AI layer does not claim certainty; it scores data quality, source
+# agreement, recent validation, walk-forward evidence and risk/EV before
+# allowing a visible OYNA/KONTROLLÜ/BEKLE decision.
 COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
 COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
@@ -2524,6 +2524,303 @@ def risk_analysis_snapshot(validation, neighbor1_total=None, neighbor2_total=Non
         ),
         "k1": nb_profile("K1 PAKET", neighbor1_total),
         "k2": nb_profile("K2 PAKET", neighbor2_total),
+    }
+
+
+def _ai_clamp(value, low=0.0, high=100.0):
+    try:
+        v = float(value)
+    except Exception:
+        v = 0.0
+    return max(float(low), min(float(high), v))
+
+
+def ai_decision_engine(
+    pred,
+    validation,
+    validation_history,
+    recent20,
+    walkforward,
+    risk_profile,
+    history,
+    table500_count=0,
+    table_long_count=0,
+    bank_count=0,
+    locked_live=None,
+):
+    """
+    Local AI-style meta decision layer.
+
+    This is deliberately not a new roulette oracle. It is a learned gate over
+    the program's existing signals: data depth, source/family agreement,
+    out-of-sample validation, walk-forward evidence, locked-live K1/K2 edge,
+    drift gates and risk math. It can approve, reduce, or block a signal.
+    """
+    pred = pred or {}
+    net = pred.get("net_pick") or {}
+    validation = validation or {}
+    validation_history = [r for r in (validation_history or []) if isinstance(r, dict)]
+    recent20 = recent20 or {}
+    walkforward = walkforward or {}
+    risk_profile = risk_profile or {}
+    history = list(history or [])
+    locked_live = locked_live or {}
+
+    def num(x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
+
+    def pct_from_hits(hit, n):
+        n = int(n or 0)
+        return (float(hit or 0) / n * 100.0) if n else 0.0
+
+    shown_signal = num(pred.get("_shown_signal", pred.get("model_score", 0.0)))
+    model_share = num(pred.get("model_share", 0.0))
+    family_count = max(0, int(net.get("family_count", 0) or 0))
+    family_supporters = list(net.get("family_supporters") or [])
+    family_picks = {
+        str(k): int(v) for k, v in (net.get("family_picks") or {}).items()
+        if str(v).lstrip("-").isdigit()
+    }
+    support_ratio = len(family_supporters) / max(1, family_count)
+    distinct_picks = len(set(family_picks.values())) if family_picks else 0
+    conflict = bool(family_count >= 2 and distinct_picks >= family_count and len(family_supporters) <= 1)
+
+    # Data quality/depth: prefer current-table SON500 + long archive, but also
+    # count enough live history and learned table banks.
+    table500_count = max(0, int(table500_count or 0))
+    table_long_count = max(0, int(table_long_count or 0))
+    bank_count = max(0, int(bank_count or 0))
+    live_count = len([x for x in history if isinstance(x, int) and 0 <= int(x) <= 36])
+    data_score = 0.0
+    data_score += 12.0 * min(1.0, table500_count / 500.0)
+    data_score += 10.0 * min(1.0, table_long_count / 1500.0)
+    data_score += 4.0 * min(1.0, live_count / 20.0)
+    data_score += 4.0 * min(1.0, bank_count / 25.0)
+    data_score = _ai_clamp(data_score, 0.0, 30.0)
+
+    signal_score = 22.0 * _ai_clamp(shown_signal, 0, 100) / 100.0
+    support_score = 18.0 * support_ratio + (4.0 if family_count >= 3 else 0.0)
+    share_score = 5.0 * min(1.0, max(0.0, model_share - 2.70) / 4.0)
+
+    trials = int(validation.get("trials", 0) or 0)
+    recent_trials = int(recent20.get("trials", 0) or 0)
+    total_top5 = pct_from_hits(validation.get("top5", 0), trials)
+    total_exact = pct_from_hits(validation.get("exact", 0), trials)
+
+    # Top5 random baseline is 5/37=13.51%. Exact baseline is 1/37=2.70%.
+    perf_score = 0.0
+    if trials >= 20:
+        perf_score += _ai_clamp((total_top5 - (5.0 / 37.0 * 100.0)) * 0.70, -8.0, 10.0)
+        perf_score += _ai_clamp((total_exact - (1.0 / 37.0 * 100.0)) * 1.25, -5.0, 7.0)
+    if recent_trials >= 8:
+        perf_score += _ai_clamp((num(recent20.get("top5", 0.0)) - (5.0 / 37.0 * 100.0)) * 0.55, -7.0, 9.0)
+        perf_score += _ai_clamp((num(recent20.get("neighbor5", 0.0)) - 13.5) * 0.20, -4.0, 5.0)
+
+    wf_trials = int(walkforward.get("trials", 0) or 0)
+    wf_edge = num(walkforward.get("edge_pp", 0.0))
+    wf_score = 0.0
+    if wf_trials >= 80:
+        wf_score += 8.0 if bool(walkforward.get("qualified", False)) else -11.0
+        wf_score += _ai_clamp(wf_edge * 0.75, -8.0, 8.0)
+    elif wf_trials >= 25:
+        wf_score += _ai_clamp(wf_edge * 0.35, -4.0, 4.0)
+
+    locked_profiles = (locked_live or {}).get("profiles") or locked_live_profiles(locked_live)
+    locked_score = 0.0
+    locked_count = 0
+    for tag, weight in (("50", 0.45), ("100", 0.35), ("all", 0.20)):
+        pr = locked_profiles.get(tag) or {}
+        n = int(pr.get("trials", 0) or 0)
+        if n <= 0:
+            continue
+        locked_count += n
+        k1_edge = num(pr.get("k1_edge", 0.0))
+        k2_edge = num(pr.get("k2_edge", 0.0))
+        locked_score += weight * _ai_clamp(max(k1_edge, k2_edge) * 0.70, -7.0, 9.0)
+
+    # Drift gates from exact profiles: if a source is weakening, AI should be
+    # more selective even when the raw signal looks attractive.
+    gates = net.get("gates") or {}
+    drift_penalty = 0.0
+    weak_gates = []
+    strong_gates = []
+    for key, row in gates.items():
+        state = str((row or {}).get("state") or "STABİL")
+        gate = num((row or {}).get("gate", 1.0), 1.0)
+        if gate < 0.80 or "ZAYIF" in state:
+            drift_penalty += 3.5
+            weak_gates.append(str(key))
+        elif gate > 1.03 or "GÜÇLÜ" in state:
+            strong_gates.append(str(key))
+
+    # Risk/EV profile is used only as a gate; it never claims a true edge.
+    risk_score = 0.0
+    risk_reasons = []
+    for key in ("k1", "k2", "top5"):
+        row = risk_profile.get(key) or {}
+        n = int(row.get("trials", 0) or 0)
+        status = str(row.get("status") or "")
+        if not n:
+            continue
+        if "KANITLI" in status:
+            risk_score += 6.0
+            risk_reasons.append(f"{key.upper()} kanıtlı artı")
+        elif "ARTI" in status:
+            risk_score += 3.0
+            risk_reasons.append(f"{key.upper()} artı")
+        elif "TABAN ALTI" in status:
+            risk_score -= 5.0
+            risk_reasons.append(f"{key.upper()} taban altı")
+
+    # Self-learning gate: previous AI-approved rows are scored after the real
+    # result. If AI-approved rounds are underperforming, the next approvals get
+    # harder; if they are beating the Top5 baseline, approval gets easier.
+    ai_self_score = 0.0
+    ai_rows = [
+        r for r in validation_history[-80:]
+        if str(r.get("shown_ai_action") or "")
+    ]
+    approved_rows = [
+        r for r in ai_rows
+        if str(r.get("shown_ai_action") or "") in ("OYNA", "KONTROLLÜ")
+    ]
+    if len(approved_rows) >= 10:
+        ai_top5 = sum(1 for r in approved_rows if bool(r.get("top5"))) / len(approved_rows) * 100.0
+        ai_self_score += _ai_clamp((ai_top5 - (5.0 / 37.0 * 100.0)) * 0.55, -7.0, 9.0)
+        if ai_top5 < 9.0:
+            risk_reasons.append("AI onayları zayıflıyor")
+    if len(ai_rows) >= 20:
+        ai_wait_rows = [
+            r for r in ai_rows
+            if str(r.get("shown_ai_action") or "") in ("BEKLE", "VERİ BEKLE", "MASA DEĞİŞTİR", "İZLE")
+        ]
+        # If rows the AI rejected would have been strong, become less strict.
+        if len(ai_wait_rows) >= 10:
+            wait_top5 = sum(1 for r in ai_wait_rows if bool(r.get("top5"))) / len(ai_wait_rows) * 100.0
+            if wait_top5 >= 20.0:
+                ai_self_score += 3.0
+                risk_reasons.append("beklenen turlar güçlü çıktı")
+
+    # Small sanity/volatility penalty: if the last20 is extremely repetitive or
+    # too fragmented, force a more cautious label rather than overconfidence.
+    volatility_penalty = 0.0
+    if live_count >= 12:
+        freq = Counter(int(x) for x in history[:20] if isinstance(x, int) and 0 <= int(x) <= 36)
+        max_rep = max(freq.values()) if freq else 0
+        unique = len(freq)
+        if max_rep >= 5:
+            volatility_penalty += 2.0
+        if unique >= 18:
+            volatility_penalty += 2.0
+
+    base = 28.0
+    raw_score = (
+        base + data_score + signal_score + support_score + share_score
+        + perf_score + wf_score + locked_score + risk_score + ai_self_score
+        - drift_penalty - volatility_penalty
+    )
+
+    penalties = []
+    if conflict:
+        raw_score -= 11.0
+        penalties.append("aileler çelişiyor")
+    if table500_count < 20 and table_long_count < 50:
+        raw_score -= 12.0
+        penalties.append("masa SON500/uzun veri zayıf")
+    if family_count and support_ratio <= 0.34:
+        raw_score -= 5.0
+        penalties.append("aile desteği düşük")
+
+    # Displayed as decision confidence, not real roulette probability; keep it
+    # capped so the UI never implies certainty.
+    score = _ai_clamp(raw_score, 1.0, 92.0)
+
+    # AI chooses a practical package label. It is a display recommendation only;
+    # no automated betting/casino click is performed.
+    k1_edge = k2_edge = 0.0
+    lp50 = locked_profiles.get("50") or {}
+    lpall = locked_profiles.get("all") or {}
+    if int(lp50.get("trials", 0) or 0):
+        k1_edge = num(lp50.get("k1_edge", 0.0))
+        k2_edge = num(lp50.get("k2_edge", 0.0))
+    elif int(lpall.get("trials", 0) or 0):
+        k1_edge = num(lpall.get("k1_edge", 0.0))
+        k2_edge = num(lpall.get("k2_edge", 0.0))
+
+    if score >= 78.0 and support_ratio >= 0.50 and not conflict:
+        action = "OYNA"
+        risk = "ORTA" if score < 86.0 else "DÜŞÜK"
+        package = "2K" if k2_edge > k1_edge + 1.5 and score >= 84.0 else "1K"
+    elif score >= 64.0 and not conflict:
+        action = "KONTROLLÜ"
+        risk = "ORTA"
+        package = "1K"
+    elif score >= 50.0:
+        action = "İZLE"
+        risk = "YÜKSEK"
+        package = "BEKLE"
+    else:
+        action = "BEKLE"
+        risk = "YÜKSEK"
+        package = "BEKLE"
+
+    if data_score < 8.0 and score < 58.0:
+        action = "VERİ BEKLE"
+        package = "BEKLE"
+    if score < 42.0 and table500_count < 20 and table_long_count < 100:
+        action = "MASA DEĞİŞTİR"
+        package = "BEKLE"
+
+    reason_parts = []
+    if family_supporters:
+        reason_parts.append("aile desteği " + "+".join(str(x) for x in family_supporters[:3]))
+    elif family_count:
+        reason_parts.append("aile lideri " + str(net.get("leader_family") or "-"))
+    if data_score >= 20.0:
+        reason_parts.append("masa verisi güçlü")
+    elif data_score < 10.0:
+        reason_parts.append("masa verisi zayıf")
+    if wf_trials >= 25:
+        reason_parts.append(f"WF edge {wf_edge:+.1f}p")
+    if recent_trials >= 8:
+        reason_parts.append(f"son{recent_trials} Top5 %{num(recent20.get('top5',0.0)):.0f}")
+    if risk_reasons:
+        reason_parts.append(risk_reasons[0])
+    if weak_gates:
+        reason_parts.append("zayıflayan kaynak var")
+    if penalties:
+        reason_parts.append("uyarı: " + ", ".join(penalties[:2]))
+    if not reason_parts:
+        reason_parts.append("veri toplanıyor")
+
+    return {
+        "version": "V2.9.43",
+        "action": action,
+        "score": float(score),
+        "confidence": float(score),
+        "risk": risk,
+        "package": package,
+        "data_score": float(data_score),
+        "signal_score": float(shown_signal),
+        "support_ratio": float(support_ratio),
+        "family_count": int(family_count),
+        "family_supporters": list(family_supporters),
+        "conflict": bool(conflict),
+        "table500_count": int(table500_count),
+        "table_long_count": int(table_long_count),
+        "wf_edge": float(wf_edge),
+        "wf_trials": int(wf_trials),
+        "locked_count": int(locked_count),
+        "ai_self_score": float(ai_self_score),
+        "k1_edge": float(k1_edge),
+        "k2_edge": float(k2_edge),
+        "weak_gates": weak_gates,
+        "strong_gates": strong_gates,
+        "reasons": reason_parts[:4],
+        "explain": " • ".join(reason_parts[:4]),
     }
 
 
@@ -5448,6 +5745,10 @@ class RouletteState:
             pred.get("_shown_signal", pred.get("model_score", 0.0)) or 0.0
         )
         shown_quality = str(pred.get("_shown_quality") or "")
+        shown_ai = dict(pred.get("_ai_decision") or {})
+        shown_ai_action = str(shown_ai.get("action") or "")
+        shown_ai_score = float(shown_ai.get("score", 0.0) or 0.0)
+        shown_ai_risk = str(shown_ai.get("risk") or "")
 
         compare_result = (
             "ORTAK"
@@ -5715,6 +6016,9 @@ class RouletteState:
             "shown_mode": shown_mode,
             "shown_signal": shown_signal,
             "shown_quality": shown_quality,
+            "shown_ai_action": shown_ai_action,
+            "shown_ai_score": shown_ai_score,
+            "shown_ai_risk": shown_ai_risk,
             "predicted_region": str(pred.get("region_name") or ""),
             "actual_region": str(region_of_number(actual) or ""),
             "source_round": source_round,
@@ -5794,6 +6098,7 @@ class RouletteState:
                 "source_round": source_round,
                 "model_share": pred["model_share"],
                 "model_score": pred["model_score"],
+                "ai_decision": shown_ai,
                 "weights": pred["weights"],
                 "walkforward": pred.get("walkforward", {}),
                 "actual": actual,
@@ -6109,6 +6414,29 @@ class RouletteState:
                 "source_count": len(source_answers),
             }
 
+            risk_profile = risk_analysis_snapshot(
+                self.validation,
+                self.neighbor1_stats_total,
+                self.neighbor_stats_total,
+            )
+            ai_decision = ai_decision_engine(
+                pred,
+                self.validation,
+                self.validation_history,
+                recent20,
+                wf_profile,
+                risk_profile,
+                h,
+                table500_count=len(self.table_history_500),
+                table_long_count=len(self.table_long_history),
+                bank_count=len(self.table_registry),
+                locked_live=self.locked_live,
+            )
+            pred["_ai_decision"] = dict(ai_decision)
+            pending_compare["ai_action"] = str(ai_decision.get("action") or "")
+            pending_compare["ai_score"] = float(ai_decision.get("score", 0.0) or 0.0)
+            pending_compare["ai_package"] = str(ai_decision.get("package") or "")
+
             return {
                 "chrome": self.chrome_connected,
                 "seen": self.roulette_seen,
@@ -6180,11 +6508,8 @@ class RouletteState:
                     "count": len((self.locked_live or {}).get("rows") or []),
                     "profiles": locked_live_profiles(self.locked_live),
                 },
-                "risk_profile": risk_analysis_snapshot(
-                    self.validation,
-                    self.neighbor1_stats_total,
-                    self.neighbor_stats_total,
-                ),
+                "risk_profile": risk_profile,
+                "ai_decision": ai_decision,
                 "comparison_batch_count": len(self.display_compare_batch),
                 "neighbor_records": neighbor_records,
                 "neighbor_stats": neighbor_stats,
@@ -12271,7 +12596,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.42 • Lobi Bitti Düzeltme")
+        self.root.title("Roulette Pro AI V2.9.43 • AI Karar Motoru")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12442,7 +12767,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.42 LOBİ BİTTİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.43 AI KARAR",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -12520,6 +12845,23 @@ class App:
         self.confidence.pack()
         self.quality_line = tk.Label(master,text="VERİ MODU: KAYNAKLAR KAYDEDİLİYOR",font=("Segoe UI",9,"bold"),fg=self.GREEN,bg=self.PANEL)
         self.quality_line.pack()
+        self.ai_line = tk.Label(
+            master,
+            text="AI KARAR: veri bekleniyor",
+            font=("Segoe UI",10,"bold"),
+            fg=self.YELLOW,
+            bg=self.PANEL,
+        )
+        self.ai_line.pack(pady=(3,0))
+        self.ai_reason_line = tk.Label(
+            master,
+            text="AI mevcut kaynakları tartıyor",
+            font=("Consolas",8,"bold"),
+            fg=self.MUTED,
+            bg=self.PANEL,
+            wraplength=390,
+        )
+        self.ai_reason_line.pack(pady=(0,2))
 
         # V2.8.8 - manual play helper only.
         # These buttons NEVER click the casino UI and NEVER place a bet.
@@ -13715,6 +14057,25 @@ class App:
                 text=f"VERİ MODU: KAYNAKLAR KAYDEDİLİYOR • WF {quality}",
                 fg=self.GREEN,
             )
+            ai = s.get("ai_decision") or {}
+            ai_action = str(ai.get("action") or "VERİ BEKLE")
+            ai_score = float(ai.get("score", 0.0) or 0.0)
+            ai_risk = str(ai.get("risk") or "-")
+            ai_pkg = str(ai.get("package") or "BEKLE")
+            ai_fg = (
+                self.GREEN if ai_action == "OYNA"
+                else self.BLUE if ai_action == "KONTROLLÜ"
+                else self.YELLOW if ai_action in ("İZLE", "VERİ BEKLE")
+                else self.RED
+            )
+            self.ai_line.config(
+                text=f"AI KARAR: {ai_action} • GÜVEN %{ai_score:.0f} • RİSK {ai_risk} • PAKET {ai_pkg}",
+                fg=ai_fg,
+            )
+            self.ai_reason_line.config(
+                text=(str(ai.get("explain") or "veri toplanıyor")[:180]),
+                fg=ai_fg if ai_action in ("OYNA", "KONTROLLÜ") else self.MUTED,
+            )
             cov = s.get("coverage") or {}
             self.coverage_line.config(text=(
                 f"TEORİK KAPSAMA • 1 sayı %{float(cov.get('single',0)):.1f} • "
@@ -14091,6 +14452,8 @@ class App:
             self.confidence.config(text="KAYNAK UYUMU: --")
             self.model_share.config(text="MODEL PAYI: --")
             self.quality_line.config(text="VERİ MODU: KAYNAKLAR KAYDEDİLİYOR", fg=self.GREEN)
+            self.ai_line.config(text="AI KARAR: veri bekleniyor", fg=self.YELLOW)
+            self.ai_reason_line.config(text="AI mevcut kaynakları tartıyor", fg=self.MUTED)
             self.stage_line.config(text="ÖĞRENME AŞAMASI: --")
             self.watch_list.config(text="Rulet masasını aç")
             self.validation_line.config(text="Henüz veri yok.")
@@ -14201,6 +14564,9 @@ class App:
             pmain = pending_cmp.get("predicted")
             pside = pending_cmp.get("side4") or []
             source_count = int(pending_cmp.get("source_count",0) or 0)
+            ai_action = str(pending_cmp.get("ai_action") or "AI")
+            ai_score = float(pending_cmp.get("ai_score",0.0) or 0.0)
+            ai_package = str(pending_cmp.get("ai_package") or "")
             current_batch = int(s.get("comparison_batch_count",0) or 0)
             next_no = 1 if current_batch >= 12 else current_batch + 1
 
@@ -14208,8 +14574,8 @@ class App:
                 text=(
                     f"BEKLEYEN #{next_no:02d} • NET {int(pmain):02d} • YEDEK "
                     + "/".join(f"{int(x):02d}" for x in pside)
-                    + f" • {source_count} kaynak/model kaydediliyor\n"
-                    "Yeni sonuç geldiğinde tüm kaynaklar ayrı ayrı puanlanacak."
+                    + f" • AI {ai_action} %{ai_score:.0f} {ai_package}\n"
+                    + f"{source_count} kaynak/model kaydediliyor • sonuç gelince AI de puanlanacak."
                 ),
                 fg=self.BLUE,
             )

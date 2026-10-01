@@ -1,0 +1,35 @@
+ROULETTE PRO AI V2.9.43 AI KARAR MOTORU KURULUM
+
+KURULUM
+1. ZIP dosyasını indir.
+2. ZIP içindeki dosyaları mevcut program klasörüne çıkar.
+3. Sorarsa üzerine yaz.
+4. Programı başlat:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.43 AI KARAR yazmalı.
+- Ana panelde şu satır görünmeli:
+  AI KARAR: ...
+
+KULLANIM
+1. Programı normal şekilde aç.
+2. Masadan veri gelsin veya TEK SEKME LOBİ TOPLA • 5 DK ile masa bankalarını güncelle.
+3. NET sayı ve yedekler hesaplanırken AI artık ayrıca karar verir.
+4. AI satırına bak:
+   - OYNA: en güçlü onay
+   - KONTROLLÜ: sinyal var ama temkinli
+   - İZLE / BEKLE: sinyal yeterince güçlü değil
+   - VERİ BEKLE: masa verisi eksik
+   - MASA DEĞİŞTİR: bu masa zayıf görünüyor
+
+AI PAKETİ
+- PAKET 1K: AI daha dar/temkinli komşu paketini uygun görüyor.
+- PAKET 2K: AI ancak skor çok güçlü ve K2 edge daha iyi görünürse önerir.
+- PAKET BEKLE: giriş yok, izleme/bekleme.
+
+NOT
+- API key gerekmez.
+- İnternet tabanlı ChatGPT/Gemini API kullanılmaz.
+- AI tamamen mevcut program verilerinden yerel karar üretir.
+- Güven yüzdesi gerçek kazanma olasılığı değildir; model karar skorudur.
