@@ -1,5 +1,6 @@
 import base64
 import html as html_lib
+import hashlib
 import json
 import math
 import os
@@ -8,6 +9,7 @@ import shutil
 import re
 import secrets
 import socket
+import ssl
 import subprocess
 import struct
 import sys
@@ -24,12 +26,34 @@ DEBUG_PORT = 9222
 PRAGMATIC_LOBBY_SCAN_URL = (
     "https://www.meritbet868.com/tr/live-casino/home"
     "?searchTerm=pragmatic+play+lobby"
-    "&openGames=3300922-real"
-    "&gameNames=Pragmatic%20Play%20Lobby"
 )
 COLLECTOR_MAX_CONCURRENT = 6
 COLLECTOR_REFRESH_SECONDS = 600.0
 COLLECTOR_RETRY_SECONDS = 60.0
+# V2.9.43: local AI decision engine.
+# The AI layer does not claim certainty; it scores data quality, source
+# agreement, recent validation, walk-forward evidence and risk/EV before
+# allowing a visible OYNA/KONTROLLÜ/BEKLE decision.
+COLLECTOR_PROBE_INITIAL_CONCURRENT = 0
+COLLECTOR_PROBE_STEADY_CONCURRENT = 0
+COLLECTOR_PROBE_SECONDS = 12.0
+COLLECTOR_CARD_CLICK_SECONDS = 10.0
+TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
+TAB_WALK_REFRESH_SECONDS = 300.0
+TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
+TAB_WALK_TABLE_MIN_DWELL_SECONDS = 4.0
+TAB_WALK_NO_SON500_SKIP_SECONDS = 6.0
+TAB_WALK_EMPTY_SON500_SKIP_SECONDS = 12.0
+TAB_WALK_RETURN_GRACE_SECONDS = 12.0
+TAB_WALK_BLOCKED_TABLE_LABELS = (
+    "POWERUP RULET", "POWERUP ROULETTE", "POWERUP ROULET",
+    "POWER UP RULET", "POWER UP ROULETTE", "POWER UP ROULET",
+)
+DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
+DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
+DGA_DEFAULT_CURRENCY = "TRY"
+DGA_SUBSCRIBE_BATCH_SIZE = 80
+DGA_RECONNECT_SECONDS = 10.0
 
 EU_WHEEL = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26]
 RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -1010,8 +1034,10 @@ def predicted_number_neighbors(history, radius=2):
 
 
 class RawWebSocket:
-    def __init__(self, url):
+    def __init__(self, url, origin="", connect_timeout=5):
         self.url = url
+        self.origin = str(origin or "")
+        self.connect_timeout = float(connect_timeout or 5)
         self.sock = None
         self.lock = threading.Lock()
         self._connect()
@@ -1019,59 +1045,88 @@ class RawWebSocket:
     def _connect(self):
         u = urllib.parse.urlparse(self.url)
         host = u.hostname
-        port = u.port or 80
+        if not host:
+            raise RuntimeError("WebSocket host boş")
+        secure = (u.scheme or "ws").lower() == "wss"
+        port = u.port or (443 if secure else 80)
         path = u.path or "/"
         if u.query:
             path += "?" + u.query
 
-        s = socket.create_connection((host, port), timeout=5)
-        s.settimeout(None)
+        raw = socket.create_connection((host, port), timeout=self.connect_timeout)
+        raw.settimeout(None)
+        if secure:
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(raw, server_hostname=host)
+        else:
+            s = raw
 
         key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-        req = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        ).encode("ascii")
+        default_port = 443 if secure else 80
+        host_header = host if port == default_port else f"{host}:{port}"
+        headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host_header}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if self.origin:
+            headers.append(f"Origin: {self.origin}")
+        req = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii")
         s.sendall(req)
 
         response = b""
         while b"\r\n\r\n" not in response:
             chunk = s.recv(4096)
             if not chunk:
-                raise RuntimeError("Chrome DevTools bağlantısı açılamadı.")
+                raise RuntimeError("WebSocket bağlantısı açılamadı.")
             response += chunk
+            if len(response) > 65536:
+                raise RuntimeError("WebSocket handshake cevabı çok büyük")
 
         if b"101" not in response.split(b"\r\n", 1)[0]:
-            raise RuntimeError("Chrome DevTools websocket reddedildi.")
+            raise RuntimeError("WebSocket reddedildi.")
 
         self.sock = s
+
+    def settimeout(self, seconds):
+        try:
+            self.sock.settimeout(seconds)
+        except Exception:
+            pass
 
     def _read_exact(self, n):
         data = bytearray()
         while len(data) < n:
             chunk = self.sock.recv(n-len(data))
             if not chunk:
-                raise ConnectionError("DevTools bağlantısı kapandı.")
+                raise ConnectionError("WebSocket bağlantısı kapandı.")
             data.extend(chunk)
         return bytes(data)
 
-    def send_text(self, text):
-        payload = text.encode("utf-8")
+    def _send_frame(self, opcode, payload=b""):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        payload = bytes(payload or b"")
         with self.lock:
             mask = secrets.token_bytes(4)
             n = len(payload)
             if n < 126:
-                hdr = bytes([0x81, 0x80 | n])
+                hdr = bytes([0x80 | (opcode & 0x0F), 0x80 | n])
             elif n < 65536:
-                hdr = bytes([0x81, 0x80 | 126]) + struct.pack("!H", n)
+                hdr = bytes([0x80 | (opcode & 0x0F), 0x80 | 126]) + struct.pack("!H", n)
             else:
-                hdr = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", n)
+                hdr = bytes([0x80 | (opcode & 0x0F), 0x80 | 127]) + struct.pack("!Q", n)
             masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
             self.sock.sendall(hdr + mask + masked)
+
+    def send_text(self, text):
+        self._send_frame(0x1, str(text or ""))
+
+    def send_pong(self, payload=b""):
+        self._send_frame(0xA, payload)
 
     def recv_text(self):
         fragments = bytearray()
@@ -1094,8 +1149,15 @@ class RawWebSocket:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
             if opcode == 0x8:
-                raise ConnectionError("DevTools websocket kapandı.")
-            if opcode in (0x9, 0xA):
+                raise ConnectionError("WebSocket kapandı.")
+            if opcode == 0x9:
+                # Server ping; answer with pong so long-lived DGA feeds stay up.
+                try:
+                    self.send_pong(payload)
+                except Exception:
+                    pass
+                continue
+            if opcode == 0xA:
                 continue
 
             if opcode in (0x1, 0x2):
@@ -1107,14 +1169,21 @@ class RawWebSocket:
             if fin:
                 if current_opcode == 0x1:
                     return fragments.decode("utf-8", errors="replace")
+                if current_opcode == 0x2:
+                    return fragments.decode("utf-8", errors="ignore")
                 fragments.clear()
                 current_opcode = None
 
     def close(self):
         try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
             self.sock.close()
         except Exception:
             pass
+
 
 
 
@@ -2351,6 +2420,410 @@ def locked_live_profiles(locked):
         "200":locked_live_summary(rows,200),
     }
 
+
+def straight_up_risk_profile(label, hits=0, trials=0, coverage=1.0, coverage_sum=None):
+    """
+    Straight-up roulette risk view for equal 1-unit bets on covered numbers.
+
+    It separates model hit performance from unavoidable European roulette
+    payout math. A hit on any covered number returns net profit (36-coverage)
+    units for that round; a miss loses coverage units. Therefore the break-even
+    hit rate is coverage/36, while random European roulette hit rate is
+    coverage/37.
+    """
+    n = max(0, int(trials or 0))
+    h = max(0, int(hits or 0))
+
+    if coverage_sum is None:
+        cov_sum = max(0.0, float(coverage or 0.0)) * n
+        avg_cov = max(0.0, float(coverage or 0.0))
+    else:
+        cov_sum = max(0.0, float(coverage_sum or 0.0))
+        avg_cov = (cov_sum / n) if n else max(0.0, float(coverage or 0.0))
+
+    random_hit = (avg_cov / 37.0 * 100.0) if avg_cov else 0.0
+    breakeven = (avg_cov / 36.0 * 100.0) if avg_cov else 0.0
+    required_edge = breakeven - random_hit
+    random_ev_round = -avg_cov / 37.0 if avg_cov else 0.0
+    random_roi = -100.0 / 37.0 if avg_cov else 0.0
+
+    if n and cov_sum > 0.0:
+        hit_rate = h / n * 100.0
+        profit_units = h * 36.0 - cov_sum
+        roi = profit_units / cov_sum * 100.0
+        low90 = wilson_lower_bound(h, n) * 100.0
+
+        if avg_cov > 36.0:
+            status = "BAŞABAŞ İMKANSIZ"
+        elif low90 >= breakeven and n >= 40:
+            status = "KANITLI ARTI"
+        elif hit_rate >= breakeven:
+            status = "ARTI AMA ERKEN"
+        elif hit_rate < random_hit:
+            status = "TABAN ALTI"
+        else:
+            status = "BAŞABAŞ ALTI"
+    else:
+        hit_rate = 0.0
+        profit_units = 0.0
+        roi = 0.0
+        low90 = 0.0
+        status = "VERİ BEKLİYOR"
+
+    return {
+        "label": str(label),
+        "trials": n,
+        "hits": h,
+        "avg_coverage": float(avg_cov),
+        "coverage_sum": float(cov_sum),
+        "random_hit_pct": float(random_hit),
+        "breakeven_hit_pct": float(breakeven),
+        "required_edge_pp": float(required_edge),
+        "random_ev_units_per_round": float(random_ev_round),
+        "random_roi_pct": float(random_roi),
+        "hit_rate_pct": float(hit_rate),
+        "profit_units": float(profit_units),
+        "roi_pct": float(roi),
+        "wilson_low90_pct": float(low90),
+        "status": status,
+    }
+
+
+def risk_analysis_snapshot(validation, neighbor1_total=None, neighbor2_total=None):
+    """Current model/risk metrics for the visible straight-up plans."""
+    validation = validation or {}
+    n = int(validation.get("trials", 0) or 0)
+
+    def nb_profile(label, total):
+        total = total or {}
+        tn = int(total.get("trials", 0) or 0)
+        hits = int(total.get("any_hits", 0) or 0)
+        cov_sum = float(total.get("coverage_sum", 0.0) or 0.0)
+        avg_cov = (cov_sum / tn) if tn else 0.0
+        return straight_up_risk_profile(
+            label,
+            hits=hits,
+            trials=tn,
+            coverage=avg_cov,
+            coverage_sum=cov_sum,
+        )
+
+    return {
+        "note": "35:1 düz sayı matematiği; garanti/gerçek olasılık değildir.",
+        "net": straight_up_risk_profile(
+            "NET",
+            hits=int(validation.get("exact", 0) or 0),
+            trials=n,
+            coverage=1.0,
+        ),
+        "top5": straight_up_risk_profile(
+            "NET+YEDEK TOP5",
+            hits=int(validation.get("top5", 0) or 0),
+            trials=n,
+            coverage=5.0,
+        ),
+        "k1": nb_profile("K1 PAKET", neighbor1_total),
+        "k2": nb_profile("K2 PAKET", neighbor2_total),
+    }
+
+
+def _ai_clamp(value, low=0.0, high=100.0):
+    try:
+        v = float(value)
+    except Exception:
+        v = 0.0
+    return max(float(low), min(float(high), v))
+
+
+def ai_decision_engine(
+    pred,
+    validation,
+    validation_history,
+    recent20,
+    walkforward,
+    risk_profile,
+    history,
+    table500_count=0,
+    table_long_count=0,
+    bank_count=0,
+    locked_live=None,
+):
+    """
+    Local AI-style meta decision layer.
+
+    This is deliberately not a new roulette oracle. It is a learned gate over
+    the program's existing signals: data depth, source/family agreement,
+    out-of-sample validation, walk-forward evidence, locked-live K1/K2 edge,
+    drift gates and risk math. It can approve, reduce, or block a signal.
+    """
+    pred = pred or {}
+    net = pred.get("net_pick") or {}
+    validation = validation or {}
+    validation_history = [r for r in (validation_history or []) if isinstance(r, dict)]
+    recent20 = recent20 or {}
+    walkforward = walkforward or {}
+    risk_profile = risk_profile or {}
+    history = list(history or [])
+    locked_live = locked_live or {}
+
+    def num(x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
+
+    def pct_from_hits(hit, n):
+        n = int(n or 0)
+        return (float(hit or 0) / n * 100.0) if n else 0.0
+
+    shown_signal = num(pred.get("_shown_signal", pred.get("model_score", 0.0)))
+    model_share = num(pred.get("model_share", 0.0))
+    family_count = max(0, int(net.get("family_count", 0) or 0))
+    family_supporters = list(net.get("family_supporters") or [])
+    family_picks = {
+        str(k): int(v) for k, v in (net.get("family_picks") or {}).items()
+        if str(v).lstrip("-").isdigit()
+    }
+    support_ratio = len(family_supporters) / max(1, family_count)
+    distinct_picks = len(set(family_picks.values())) if family_picks else 0
+    conflict = bool(family_count >= 2 and distinct_picks >= family_count and len(family_supporters) <= 1)
+
+    # Data quality/depth: prefer current-table SON500 + long archive, but also
+    # count enough live history and learned table banks.
+    table500_count = max(0, int(table500_count or 0))
+    table_long_count = max(0, int(table_long_count or 0))
+    bank_count = max(0, int(bank_count or 0))
+    live_count = len([x for x in history if isinstance(x, int) and 0 <= int(x) <= 36])
+    data_score = 0.0
+    data_score += 12.0 * min(1.0, table500_count / 500.0)
+    data_score += 10.0 * min(1.0, table_long_count / 1500.0)
+    data_score += 4.0 * min(1.0, live_count / 20.0)
+    data_score += 4.0 * min(1.0, bank_count / 25.0)
+    data_score = _ai_clamp(data_score, 0.0, 30.0)
+
+    signal_score = 22.0 * _ai_clamp(shown_signal, 0, 100) / 100.0
+    support_score = 18.0 * support_ratio + (4.0 if family_count >= 3 else 0.0)
+    share_score = 5.0 * min(1.0, max(0.0, model_share - 2.70) / 4.0)
+
+    trials = int(validation.get("trials", 0) or 0)
+    recent_trials = int(recent20.get("trials", 0) or 0)
+    total_top5 = pct_from_hits(validation.get("top5", 0), trials)
+    total_exact = pct_from_hits(validation.get("exact", 0), trials)
+
+    # Top5 random baseline is 5/37=13.51%. Exact baseline is 1/37=2.70%.
+    perf_score = 0.0
+    if trials >= 20:
+        perf_score += _ai_clamp((total_top5 - (5.0 / 37.0 * 100.0)) * 0.70, -8.0, 10.0)
+        perf_score += _ai_clamp((total_exact - (1.0 / 37.0 * 100.0)) * 1.25, -5.0, 7.0)
+    if recent_trials >= 8:
+        perf_score += _ai_clamp((num(recent20.get("top5", 0.0)) - (5.0 / 37.0 * 100.0)) * 0.55, -7.0, 9.0)
+        perf_score += _ai_clamp((num(recent20.get("neighbor5", 0.0)) - 13.5) * 0.20, -4.0, 5.0)
+
+    wf_trials = int(walkforward.get("trials", 0) or 0)
+    wf_edge = num(walkforward.get("edge_pp", 0.0))
+    wf_score = 0.0
+    if wf_trials >= 80:
+        wf_score += 8.0 if bool(walkforward.get("qualified", False)) else -11.0
+        wf_score += _ai_clamp(wf_edge * 0.75, -8.0, 8.0)
+    elif wf_trials >= 25:
+        wf_score += _ai_clamp(wf_edge * 0.35, -4.0, 4.0)
+
+    locked_profiles = (locked_live or {}).get("profiles") or locked_live_profiles(locked_live)
+    locked_score = 0.0
+    locked_count = 0
+    for tag, weight in (("50", 0.45), ("100", 0.35), ("all", 0.20)):
+        pr = locked_profiles.get(tag) or {}
+        n = int(pr.get("trials", 0) or 0)
+        if n <= 0:
+            continue
+        locked_count += n
+        k1_edge = num(pr.get("k1_edge", 0.0))
+        k2_edge = num(pr.get("k2_edge", 0.0))
+        locked_score += weight * _ai_clamp(max(k1_edge, k2_edge) * 0.70, -7.0, 9.0)
+
+    # Drift gates from exact profiles: if a source is weakening, AI should be
+    # more selective even when the raw signal looks attractive.
+    gates = net.get("gates") or {}
+    drift_penalty = 0.0
+    weak_gates = []
+    strong_gates = []
+    for key, row in gates.items():
+        state = str((row or {}).get("state") or "STABİL")
+        gate = num((row or {}).get("gate", 1.0), 1.0)
+        if gate < 0.80 or "ZAYIF" in state:
+            drift_penalty += 3.5
+            weak_gates.append(str(key))
+        elif gate > 1.03 or "GÜÇLÜ" in state:
+            strong_gates.append(str(key))
+
+    # Risk/EV profile is used only as a gate; it never claims a true edge.
+    risk_score = 0.0
+    risk_reasons = []
+    for key in ("k1", "k2", "top5"):
+        row = risk_profile.get(key) or {}
+        n = int(row.get("trials", 0) or 0)
+        status = str(row.get("status") or "")
+        if not n:
+            continue
+        if "KANITLI" in status:
+            risk_score += 6.0
+            risk_reasons.append(f"{key.upper()} kanıtlı artı")
+        elif "ARTI" in status:
+            risk_score += 3.0
+            risk_reasons.append(f"{key.upper()} artı")
+        elif "TABAN ALTI" in status:
+            risk_score -= 5.0
+            risk_reasons.append(f"{key.upper()} taban altı")
+
+    # Self-learning gate: previous AI-approved rows are scored after the real
+    # result. If AI-approved rounds are underperforming, the next approvals get
+    # harder; if they are beating the Top5 baseline, approval gets easier.
+    ai_self_score = 0.0
+    ai_rows = [
+        r for r in validation_history[-80:]
+        if str(r.get("shown_ai_action") or "")
+    ]
+    approved_rows = [
+        r for r in ai_rows
+        if str(r.get("shown_ai_action") or "") in ("OYNA", "KONTROLLÜ")
+    ]
+    if len(approved_rows) >= 10:
+        ai_top5 = sum(1 for r in approved_rows if bool(r.get("top5"))) / len(approved_rows) * 100.0
+        ai_self_score += _ai_clamp((ai_top5 - (5.0 / 37.0 * 100.0)) * 0.55, -7.0, 9.0)
+        if ai_top5 < 9.0:
+            risk_reasons.append("AI onayları zayıflıyor")
+    if len(ai_rows) >= 20:
+        ai_wait_rows = [
+            r for r in ai_rows
+            if str(r.get("shown_ai_action") or "") in ("BEKLE", "VERİ BEKLE", "MASA DEĞİŞTİR", "İZLE")
+        ]
+        # If rows the AI rejected would have been strong, become less strict.
+        if len(ai_wait_rows) >= 10:
+            wait_top5 = sum(1 for r in ai_wait_rows if bool(r.get("top5"))) / len(ai_wait_rows) * 100.0
+            if wait_top5 >= 20.0:
+                ai_self_score += 3.0
+                risk_reasons.append("beklenen turlar güçlü çıktı")
+
+    # Small sanity/volatility penalty: if the last20 is extremely repetitive or
+    # too fragmented, force a more cautious label rather than overconfidence.
+    volatility_penalty = 0.0
+    if live_count >= 12:
+        freq = Counter(int(x) for x in history[:20] if isinstance(x, int) and 0 <= int(x) <= 36)
+        max_rep = max(freq.values()) if freq else 0
+        unique = len(freq)
+        if max_rep >= 5:
+            volatility_penalty += 2.0
+        if unique >= 18:
+            volatility_penalty += 2.0
+
+    base = 28.0
+    raw_score = (
+        base + data_score + signal_score + support_score + share_score
+        + perf_score + wf_score + locked_score + risk_score + ai_self_score
+        - drift_penalty - volatility_penalty
+    )
+
+    penalties = []
+    if conflict:
+        raw_score -= 11.0
+        penalties.append("aileler çelişiyor")
+    if table500_count < 20 and table_long_count < 50:
+        raw_score -= 12.0
+        penalties.append("masa SON500/uzun veri zayıf")
+    if family_count and support_ratio <= 0.34:
+        raw_score -= 5.0
+        penalties.append("aile desteği düşük")
+
+    # Displayed as decision confidence, not real roulette probability; keep it
+    # capped so the UI never implies certainty.
+    score = _ai_clamp(raw_score, 1.0, 92.0)
+
+    # AI chooses a practical package label. It is a display recommendation only;
+    # no automated betting/casino click is performed.
+    k1_edge = k2_edge = 0.0
+    lp50 = locked_profiles.get("50") or {}
+    lpall = locked_profiles.get("all") or {}
+    if int(lp50.get("trials", 0) or 0):
+        k1_edge = num(lp50.get("k1_edge", 0.0))
+        k2_edge = num(lp50.get("k2_edge", 0.0))
+    elif int(lpall.get("trials", 0) or 0):
+        k1_edge = num(lpall.get("k1_edge", 0.0))
+        k2_edge = num(lpall.get("k2_edge", 0.0))
+
+    if score >= 78.0 and support_ratio >= 0.50 and not conflict:
+        action = "OYNA"
+        risk = "ORTA" if score < 86.0 else "DÜŞÜK"
+        package = "2K" if k2_edge > k1_edge + 1.5 and score >= 84.0 else "1K"
+    elif score >= 64.0 and not conflict:
+        action = "KONTROLLÜ"
+        risk = "ORTA"
+        package = "1K"
+    elif score >= 50.0:
+        action = "İZLE"
+        risk = "YÜKSEK"
+        package = "BEKLE"
+    else:
+        action = "BEKLE"
+        risk = "YÜKSEK"
+        package = "BEKLE"
+
+    if data_score < 8.0 and score < 58.0:
+        action = "VERİ BEKLE"
+        package = "BEKLE"
+    if score < 42.0 and table500_count < 20 and table_long_count < 100:
+        action = "MASA DEĞİŞTİR"
+        package = "BEKLE"
+
+    reason_parts = []
+    if family_supporters:
+        reason_parts.append("aile desteği " + "+".join(str(x) for x in family_supporters[:3]))
+    elif family_count:
+        reason_parts.append("aile lideri " + str(net.get("leader_family") or "-"))
+    if data_score >= 20.0:
+        reason_parts.append("masa verisi güçlü")
+    elif data_score < 10.0:
+        reason_parts.append("masa verisi zayıf")
+    if wf_trials >= 25:
+        reason_parts.append(f"WF edge {wf_edge:+.1f}p")
+    if recent_trials >= 8:
+        reason_parts.append(f"son{recent_trials} Top5 %{num(recent20.get('top5',0.0)):.0f}")
+    if risk_reasons:
+        reason_parts.append(risk_reasons[0])
+    if weak_gates:
+        reason_parts.append("zayıflayan kaynak var")
+    if penalties:
+        reason_parts.append("uyarı: " + ", ".join(penalties[:2]))
+    if not reason_parts:
+        reason_parts.append("veri toplanıyor")
+
+    return {
+        "version": "V2.9.43",
+        "action": action,
+        "score": float(score),
+        "confidence": float(score),
+        "risk": risk,
+        "package": package,
+        "data_score": float(data_score),
+        "signal_score": float(shown_signal),
+        "support_ratio": float(support_ratio),
+        "family_count": int(family_count),
+        "family_supporters": list(family_supporters),
+        "conflict": bool(conflict),
+        "table500_count": int(table500_count),
+        "table_long_count": int(table_long_count),
+        "wf_edge": float(wf_edge),
+        "wf_trials": int(wf_trials),
+        "locked_count": int(locked_count),
+        "ai_self_score": float(ai_self_score),
+        "k1_edge": float(k1_edge),
+        "k2_edge": float(k2_edge),
+        "weak_gates": weak_gates,
+        "strong_gates": strong_gates,
+        "reasons": reason_parts[:4],
+        "explain": " • ".join(reason_parts[:4]),
+    }
+
+
 def exact_window_profiles(validation_history, source_hits=None, expert_hits=None):
     """
     Exact-number performance only:
@@ -2783,6 +3256,11 @@ DIRECT_RESULT_KEYS = (
     "resultNumber", "result_number",
     "rouletteNumber", "roulette_number",
     "winningPocket", "winning_pocket",
+    "gameResult", "game_result",
+    "spinResult", "spin_result",
+    "outcomeNumber", "outcome_number",
+    "resultValue", "result_value",
+    "slotNumber", "slot_number",
 )
 
 def _roulette_num(value):
@@ -2798,6 +3276,21 @@ def _roulette_num(value):
             return int(s)
     return None
 
+
+def _roulette_num_loose(value):
+    n = _roulette_num(value)
+    if n is not None:
+        return n
+    if isinstance(value, str):
+        s = value.strip()
+        # For named result fields Pragmatic may return strings like "29 BLACK"
+        # or "Winning number: 29". Accept a single roulette number token only.
+        nums = re.findall(r"(?<!\d)(?:[0-9]|[12][0-9]|3[0-6])(?!\d)", s)
+        if len(nums) == 1:
+            return int(nums[0])
+    return None
+
+
 def _find_result_in_record(record, depth=0):
     if depth > 6:
         return None
@@ -2805,7 +3298,7 @@ def _find_result_in_record(record, depth=0):
         lower={str(k).lower():v for k,v in record.items()}
         for wanted in DIRECT_RESULT_KEYS:
             v=lower.get(wanted.lower())
-            n=_roulette_num(v)
+            n=_roulette_num_loose(v)
             if n is not None:
                 return n
             if isinstance(v,(dict,list)):
@@ -2878,6 +3371,11 @@ def extract_statistic_history(body):
             good=[n for n in primitive if n is not None]
             if len(node)>=20 and len(good)>=max(20,int(len(node)*0.80)):
                 add(good,path,35)
+            elif len(node)>=20:
+                loose=[_roulette_num_loose(v) for v in node]
+                loose_good=[n for n in loose if n is not None]
+                if len(loose_good)>=max(20,int(len(node)*0.80)):
+                    add(loose_good,path,25)
             dict_count=sum(isinstance(v,dict) for v in node)
             if len(node)>=20 and dict_count>=int(len(node)*0.60):
                 vals=[]
@@ -3140,6 +3638,73 @@ DIRECT_HISTORY_SCAN = r"""
     };
   }
 })()
+"""
+
+
+
+def build_table_api_history_fetch(table_id):
+    tid_json = json.dumps(str(table_id or ""))
+    return f"""
+(async () => {{
+  const wantedTableId = {tid_json};
+  const resources = performance.getEntriesByType('resource').map(x => x.name || '');
+  const reversed = [...resources].reverse();
+
+  let historyUrl = reversed.find(
+    u => /\/api\/ui\/statisticHistory\?/i.test(u) && /JSESSIONID=/i.test(u)
+  ) || '';
+
+  if (!historyUrl) {{
+    const statsUrl = reversed.find(
+      u => /\/api\/ui\/stats\?/i.test(u) && /JSESSIONID=/i.test(u)
+    ) || '';
+    if (statsUrl) {{
+      try {{
+        const u = new URL(statsUrl);
+        u.pathname = u.pathname.replace(/\/stats$/i, '/statisticHistory');
+        historyUrl = u.toString();
+      }} catch (_) {{}}
+    }}
+  }}
+
+  if (!historyUrl) {{
+    const apiSeed = reversed.find(raw => {{
+      try {{
+        const u = new URL(raw);
+        return /^https?:$/i.test(u.protocol) &&
+               /(^|\.)games\./i.test(u.hostname) &&
+               /\/api\//i.test(u.pathname) &&
+               u.searchParams.has('JSESSIONID');
+      }} catch (_) {{ return false; }}
+    }}) || '';
+    if (apiSeed) {{
+      try {{
+        const u = new URL(apiSeed);
+        u.pathname = '/api/ui/statisticHistory';
+        historyUrl = u.toString();
+      }} catch (_) {{}}
+    }}
+  }}
+
+  if (!historyUrl || !wantedTableId) {{
+    return {{ok:false, reason:'API şablonu veya tableId yok', tableId:wantedTableId, title:document.title||''}};
+  }}
+
+  try {{
+    const u = new URL(historyUrl);
+    const keepSession = u.searchParams.get('JSESSIONID') || '';
+    u.search = '';
+    if (keepSession) u.searchParams.set('JSESSIONID', keepSession);
+    u.searchParams.set('numberOfGames', '500');
+    u.searchParams.set('tableId', wantedTableId);
+
+    const r = await fetch(u.toString(), {{credentials:'include', cache:'no-store'}});
+    const body = await r.text();
+    return {{ok:!!r.ok, status:r.status, tableId:wantedTableId, title:document.title||'', body}};
+  }} catch (e) {{
+    return {{ok:false, reason:String(e && e.message || e || 'fetch failed'), tableId:wantedTableId, title:document.title||''}};
+  }}
+}})()
 """
 
 VISIBILITY_SCAN = r"""
@@ -4248,12 +4813,21 @@ class RouletteState:
                 pass
         self.collector_refreshed = refreshed
         txt = (
-            f"ÇOKLU TOPLAYICI: {active} aktif • {refreshed}/{bank_count} güncel"
+            f"MASA BANKASI: {bank_count} kayıt • {refreshed} son 5dk güncel"
             f" • {total} spin"
         )
         if extra:
             txt += f" • {extra}"
         return txt
+
+    def clear_table_registry(self, reason=""):
+        """Clear only the visible table bank registry; archives stay on disk."""
+        with self.lock:
+            self.table_registry = {}
+            self.collector_discovered = 0
+            self.collector_refreshed = 0
+            self._save_table_registry()
+            self.background_status = self._bank_status_text(reason or "banka sıfırlandı")
 
     def mark_table_discovered(self, table_id, display_name="", source="LOBI"):
         tid = str(table_id or "").strip()
@@ -5171,6 +5745,10 @@ class RouletteState:
             pred.get("_shown_signal", pred.get("model_score", 0.0)) or 0.0
         )
         shown_quality = str(pred.get("_shown_quality") or "")
+        shown_ai = dict(pred.get("_ai_decision") or {})
+        shown_ai_action = str(shown_ai.get("action") or "")
+        shown_ai_score = float(shown_ai.get("score", 0.0) or 0.0)
+        shown_ai_risk = str(shown_ai.get("risk") or "")
 
         compare_result = (
             "ORTAK"
@@ -5438,6 +6016,9 @@ class RouletteState:
             "shown_mode": shown_mode,
             "shown_signal": shown_signal,
             "shown_quality": shown_quality,
+            "shown_ai_action": shown_ai_action,
+            "shown_ai_score": shown_ai_score,
+            "shown_ai_risk": shown_ai_risk,
             "predicted_region": str(pred.get("region_name") or ""),
             "actual_region": str(region_of_number(actual) or ""),
             "source_round": source_round,
@@ -5517,6 +6098,7 @@ class RouletteState:
                 "source_round": source_round,
                 "model_share": pred["model_share"],
                 "model_score": pred["model_score"],
+                "ai_decision": shown_ai,
                 "weights": pred["weights"],
                 "walkforward": pred.get("walkforward", {}),
                 "actual": actual,
@@ -5832,6 +6414,29 @@ class RouletteState:
                 "source_count": len(source_answers),
             }
 
+            risk_profile = risk_analysis_snapshot(
+                self.validation,
+                self.neighbor1_stats_total,
+                self.neighbor_stats_total,
+            )
+            ai_decision = ai_decision_engine(
+                pred,
+                self.validation,
+                self.validation_history,
+                recent20,
+                wf_profile,
+                risk_profile,
+                h,
+                table500_count=len(self.table_history_500),
+                table_long_count=len(self.table_long_history),
+                bank_count=len(self.table_registry),
+                locked_live=self.locked_live,
+            )
+            pred["_ai_decision"] = dict(ai_decision)
+            pending_compare["ai_action"] = str(ai_decision.get("action") or "")
+            pending_compare["ai_score"] = float(ai_decision.get("score", 0.0) or 0.0)
+            pending_compare["ai_package"] = str(ai_decision.get("package") or "")
+
             return {
                 "chrome": self.chrome_connected,
                 "seen": self.roulette_seen,
@@ -5903,6 +6508,8 @@ class RouletteState:
                     "count": len((self.locked_live or {}).get("rows") or []),
                     "profiles": locked_live_profiles(self.locked_live),
                 },
+                "risk_profile": risk_profile,
+                "ai_decision": ai_decision,
                 "comparison_batch_count": len(self.display_compare_batch),
                 "neighbor_records": neighbor_records,
                 "neighbor_stats": neighbor_stats,
@@ -6083,52 +6690,116 @@ HISTORY500_SCAN = r"""
 
   function visibleStyle(el) {
     try {
-      const s = getComputedStyle(el);
-      return s.display !== "none" && s.visibility !== "hidden";
+      const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+      const s = win.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return r.width > 1 && r.height > 1 &&
+             s.display !== "none" && s.visibility !== "hidden" &&
+             Number(s.opacity || 1) !== 0;
     } catch (_) {
       return false;
     }
+  }
+
+  function deepQueryAll(root, selector) {
+    const out = [];
+    const seenRoots = new Set();
+    const pushUnique = el => {
+      if (el && !out.includes(el)) out.push(el);
+    };
+    function visit(r) {
+      if (!r || seenRoots.has(r)) return;
+      seenRoots.add(r);
+      let nodes = [];
+      try { nodes = Array.from(r.querySelectorAll(selector)); } catch (_) { nodes = []; }
+      for (const n of nodes) pushUnique(n);
+      let all = [];
+      try { all = Array.from(r.querySelectorAll('*')); } catch (_) { all = []; }
+      for (const el of all) {
+        try { if (el.shadowRoot) visit(el.shadowRoot); } catch (_) {}
+        try {
+          if (String(el.tagName || '').toUpperCase() === 'IFRAME' && el.contentDocument) {
+            visit(el.contentDocument);
+          }
+        } catch (_) {}
+      }
+    }
+    visit(root);
+    return out;
+  }
+
+  function ownTexts(el) {
+    const vals = [];
+    try { vals.push(el.innerText || ''); } catch (_) {}
+    try { vals.push(el.textContent || ''); } catch (_) {}
+    for (const a of ['aria-label','title','data-value','data-number','data-result','data-role','value']) {
+      try { vals.push(el.getAttribute(a) || ''); } catch (_) {}
+    }
+    return vals;
+  }
+
+  function numericValue(el) {
+    for (const raw of ownTexts(el)) {
+      const t = norm(raw);
+      if (numRe.test(t)) return Number(t);
+    }
+    return null;
+  }
+
+  function readableText(el) {
+    try { return el.innerText || el.textContent || ''; } catch (_) { return ''; }
+  }
+
+  function parentOf(el) {
+    if (!el) return null;
+    if (el.parentElement) return el.parentElement;
+    try {
+      const root = el.getRootNode && el.getRootNode();
+      if (root && root.host) return root.host;
+    } catch (_) {}
+    return null;
   }
 
   function numericLeaves(root) {
     const out = [];
     if (!root) return out;
 
-    for (const el of root.querySelectorAll("*")) {
+    for (const el of deepQueryAll(root, "*")) {
       if (!visibleStyle(el)) continue;
-
-      const t = norm(el.textContent);
-      if (!numRe.test(t)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
 
       // Avoid counting both a wrapper and its numeric child.
       let childHasSameNumeric = false;
-      for (const ch of el.children) {
-        if (numRe.test(norm(ch.textContent))) {
-          childHasSameNumeric = true;
-          break;
+      try {
+        for (const ch of el.children || []) {
+          const cn = numericValue(ch);
+          if (cn !== null) {
+            childHasSameNumeric = true;
+            break;
+          }
         }
-      }
+      } catch (_) {}
       if (childHasSameNumeric) continue;
 
-      const n = Number(t);
-      if (n >= 0 && n <= 36) out.push(n);
+      out.push(n);
     }
     return out;
   }
 
-  let all = Array.from(document.querySelectorAll(
-    'button,[role="tab"],[role="button"],div,span'
-  ));
+  let all = deepQueryAll(document,
+    'button,[role="tab"],[role="button"],div,span,a'
+  );
 
   function findHistoryTab() {
     let found = all.find(el => {
-      const t = norm(el.innerText || el.textContent);
+      const t = norm(readableText(el));
       return (t === "SON 500" || t === "LAST 500") && visibleStyle(el);
     });
     if (found) return found;
     return all.find(el => {
-      const t = norm(el.innerText || el.textContent);
-      return /\b(?:SON|LAST)\s*500\b/.test(t) && t.length <= 20 && visibleStyle(el);
+      const t = norm(readableText(el));
+      return /\b(?:SON|LAST)\s*500\b/.test(t) && t.length <= 28 && visibleStyle(el);
     });
   }
 
@@ -6136,12 +6807,12 @@ HISTORY500_SCAN = r"""
   let expandedDrawer = false;
   if (!tab) {
     const toggles = [];
-    for (const el of document.querySelectorAll('button,[role="button"]')) {
+    for (const el of deepQueryAll(document, 'button,[role="button"],a')) {
       if (!visibleStyle(el)) continue;
       const r = el.getBoundingClientRect();
-      const text = norm(el.innerText || el.textContent);
-      if (r.width < 16 || r.height < 16 || r.width > 90 || r.height > 90) continue;
-      if (r.left < innerWidth * 0.72 || r.top < innerHeight * 0.55 || r.top > innerHeight * 0.93) continue;
+      const text = norm(readableText(el));
+      if (r.width < 12 || r.height < 12 || r.width > 120 || r.height > 120) continue;
+      if (r.left < innerWidth * 0.64 || r.top < innerHeight * 0.45 || r.top > innerHeight * 0.96) continue;
       if (/OTOMAT|AUTOMATIC|BET|BAHİS|SPIN/.test(text)) continue;
       const hint = [
         el.id || '', el.getAttribute('class') || '',
@@ -6149,10 +6820,10 @@ HISTORY500_SCAN = r"""
         el.innerHTML || ''
       ].join(' ').toLowerCase();
       let score = 0;
-      if (/(history|statistic|result|drawer|expand|collapse|chevron|arrow|toggle)/.test(hint)) score += 80;
-      if (text === '' || text === '⌃' || text === '▲' || text === '˄') score += 25;
-      score += Math.max(0, 20 - Math.abs(innerWidth - r.right) / 8);
-      score += Math.max(0, 20 - Math.abs(innerHeight * 0.78 - (r.top + r.height/2)) / 8);
+      if (/(history|statistic|result|drawer|expand|collapse|chevron|arrow|toggle|graph|hot|cold)/.test(hint)) score += 80;
+      if (text === '' || text === '⌃' || text === '▲' || text === '˄' || text === '^') score += 25;
+      score += Math.max(0, 22 - Math.abs(innerWidth - r.right) / 8);
+      score += Math.max(0, 22 - Math.abs(innerHeight * 0.76 - (r.top + r.height/2)) / 8);
       toggles.push({el, score});
     }
     toggles.sort((a,b) => b.score - a.score);
@@ -6160,10 +6831,10 @@ HISTORY500_SCAN = r"""
       try {
         toggles[0].el.click();
         expandedDrawer = true;
-        await sleep(550);
-        all = Array.from(document.querySelectorAll(
-          'button,[role="tab"],[role="button"],div,span'
-        ));
+        await sleep(700);
+        all = deepQueryAll(document,
+          'button,[role="tab"],[role="button"],div,span,a'
+        );
         tab = findHistoryTab();
       } catch (_) {}
     }
@@ -6171,20 +6842,93 @@ HISTORY500_SCAN = r"""
 
   if (tab) {
     try { tab.click(); } catch (_) {}
-    await sleep(350);
+    await sleep(500);
   }
 
   let roots = [];
+
+  // V2.9.33: targeted read of the exact place the user pointed to:
+  // the SON 500 grid in the lower-right panel, directly above the
+  // "OTOMATIK OYUN / AUTOMATIC PLAY" button. This avoids grabbing lobby
+  // text, racetrack chips, or table cards.
+  const autoButtons = deepQueryAll(document, 'button,[role="button"],div,span,a')
+    .filter(el => visibleStyle(el) && /OTOMAT[İI]K\s*OYUN|AUTOMATIC\s*(PLAY|GAME)|AUTO\s*PLAY/.test(norm(readableText(el))));
+  const autoFound = autoButtons.length > 0;
+  function numsInRect(rect) {
+    const recs = [];
+    const seenEls = new Set();
+    for (const el of deepQueryAll(document, '*')) {
+      if (!visibleStyle(el) || seenEls.has(el)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
+      let childNumeric = false;
+      try {
+        for (const ch of el.children || []) {
+          if (numericValue(ch) !== null) { childNumeric = true; break; }
+        }
+      } catch (_) {}
+      if (childNumeric) continue;
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      if (cx < rect.left || cx > rect.right || cy < rect.top || cy > rect.bottom) continue;
+      const txt = norm(readableText(parentOf(el) || el));
+      if (/BAKIYE|BALANCE|TOPLAM\s*BAHIS|TOTAL\s*BET|BAHIS|BET|JETON|CHIP|VOISINS|ORPHELINS|TIERS|KOMŞU|KOMSU/.test(txt)) continue;
+      seenEls.add(el);
+      recs.push({n, x:cx, y:cy});
+    }
+    recs.sort((a,b) => Math.round(a.y/8)-Math.round(b.y/8) || a.x-b.x);
+    return recs.map(r => r.n);
+  }
+  const panelRects = [];
+  for (const btn of autoButtons.slice(0,4)) {
+    try {
+      const r = btn.getBoundingClientRect();
+      if (r.width < 40 || r.height < 15) continue;
+      panelRects.push({
+        left: Math.max(0, r.left - 430),
+        top: Math.max(0, r.top - 390),
+        right: Math.min(innerWidth, r.right + 60),
+        bottom: Math.max(0, r.top - 2),
+        source: 'auto-button'
+      });
+    } catch (_) {}
+  }
+  if (tab) {
+    try {
+      const tr = tab.getBoundingClientRect();
+      let bottom = innerHeight * 0.97;
+      if (autoButtons.length) {
+        const ar = autoButtons[0].getBoundingClientRect();
+        bottom = Math.max(tr.bottom + 20, ar.top - 2);
+      }
+      panelRects.push({
+        left: Math.max(0, tr.left - 320),
+        top: Math.max(0, tr.bottom - 4),
+        right: Math.min(innerWidth, tr.right + 120),
+        bottom,
+        source: 'son500-tab'
+      });
+    } catch (_) {}
+  }
+  for (const rect of panelRects) {
+    const nums = numsInRect(rect);
+    if (nums.length >= 20 && nums.length <= 650) {
+      roots.push({root:document.body, nums, count:nums.length, depth:1, score:900 + nums.length, source:rect.source});
+    }
+  }
+
   if (tab) {
     let r = tab;
-    for (let depth = 0; depth < 9 && r; depth++, r = r.parentElement) {
+    for (let depth = 0; depth < 12 && r; depth++, r = parentOf(r)) {
       const nums = numericLeaves(r);
       if (nums.length >= 20 && nums.length <= 650) {
         roots.push({
           root: r,
           nums,
           count: nums.length,
-          depth
+          depth,
+          score: nums.length * 2 + 150 - depth * 4
         });
       }
     }
@@ -6192,9 +6936,9 @@ HISTORY500_SCAN = r"""
 
   // Fallback: find compact DOM blocks mentioning SON 500.
   if (!roots.length) {
-    for (const el of document.querySelectorAll("div,section,aside")) {
+    for (const el of deepQueryAll(document, "div,section,aside,main")) {
       if (!visibleStyle(el)) continue;
-      const t = norm(el.innerText || "");
+      const t = norm(readableText(el));
       if (!/\b(?:SON|LAST)\s*500\b/.test(t)) continue;
       const nums = numericLeaves(el);
       if (nums.length >= 20 && nums.length <= 650) {
@@ -6202,33 +6946,311 @@ HISTORY500_SCAN = r"""
           root: el,
           nums,
           count: nums.length,
-          depth: 99
+          depth: 99,
+          score: nums.length * 2 + 80
         });
       }
     }
   }
 
-  // Prefer the block with the most roulette results.
-  roots.sort((a,b) => b.count - a.count || a.depth - b.depth);
+  // V2.9.32: the user's screen shows SON 500 as a visible grid on the
+  // lower-right game panel. Some builds keep the label outside the number
+  // block, inside shadow DOM, or inside a same-origin iframe. Build dense
+  // numeric clusters by layout and pick the largest non-betting cluster.
+  if (!roots.length) {
+    const records=[];
+    for (const el of deepQueryAll(document, '*')) {
+      if (!visibleStyle(el)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
+      let childNumeric=false;
+      try {
+        for (const ch of el.children || []) {
+          if (numericValue(ch) !== null) { childNumeric=true; break; }
+        }
+      } catch (_) {}
+      if (childNumeric) continue;
+      const r=el.getBoundingClientRect();
+      if (r.width < 3 || r.height < 3 || r.width > 110 || r.height > 90) continue;
+      records.push({el,n,r});
+    }
+
+    const containers=new Map();
+    for (const rec of records) {
+      let p=rec.el;
+      for (let depth=0; depth<14 && p; depth++, p=parentOf(p)) {
+        if (!visibleStyle(p)) continue;
+        let arr=containers.get(p);
+        if (!arr) { arr=[]; containers.set(p,arr); }
+        arr.push(rec);
+      }
+    }
+
+    const scored=[];
+    for (const [el, arrRaw] of containers.entries()) {
+      const seenEls=new Set();
+      const arr=[];
+      for (const rec of arrRaw) {
+        if (!seenEls.has(rec.el)) { seenEls.add(rec.el); arr.push(rec); }
+      }
+      if (arr.length < 20 || arr.length > 650) continue;
+      const r=el.getBoundingClientRect();
+      if (r.width < 90 || r.height < 50) continue;
+      const txt=norm(readableText(el));
+      let score=arr.length * 3;
+      if (/\b(?:SON|LAST)\s*500\b/.test(txt)) score += 150;
+      if (r.left > innerWidth * 0.40) score += 45;
+      if (r.top > innerHeight * 0.25) score += 25;
+      if (r.right > innerWidth * 0.62) score += 15;
+      if (/BAKIYE|BALANCE|TOPLAM\s*BAHIS|TOTAL\s*BET|BAHIS|BET|JETON|CHIP|OTOMATIK\s*OYUN|AUTOMATIC\s*PLAY|VOISINS|ORPHELINS|TIERS|1INCI|2INCI|3UNCU|1ST|2ND|3RD|KOMŞU|KOMSU/.test(txt)) score -= 180;
+      if (/SICAK|SOĞUK|SOGUK|HOT|COLD|GRAFIK|GRAPH|SON\s*500|LAST\s*500|HISTORY|STATISTIC/.test(txt)) score += 70;
+      scored.push({root:el, nums:arr.map(x=>x.n), count:arr.length, depth:120, score});
+    }
+    scored.sort((a,b)=>b.score-a.score || b.count-a.count);
+    if (scored.length) roots.push(scored[0]);
+  }
+
+  // Last fallback: if a SON500 tab is visible, take numbers in a rectangle
+  // below/near it. This matches the screenshot where the grid sits directly
+  // under the "SON 500" tab and above the Automatic Play button.
+  if (!roots.length && tab) {
+    const tr=tab.getBoundingClientRect();
+    const nums=[];
+    for (const el of deepQueryAll(document, '*')) {
+      if (!visibleStyle(el)) continue;
+      const n = numericValue(el);
+      if (n === null || n < 0 || n > 36) continue;
+      const r=el.getBoundingClientRect();
+      if (r.left < tr.left - 320 || r.right > innerWidth + 10) continue;
+      if (r.top < tr.top + 4 || r.top > innerHeight * 0.97) continue;
+      nums.push(n);
+    }
+    if (nums.length >= 20 && nums.length <= 650) {
+      roots.push({root:document.body, nums, count:nums.length, depth:150, score:nums.length + 60});
+    }
+  }
+
+  roots.sort((a,b) => (b.score || b.count) - (a.score || a.count) || b.count - a.count || a.depth - b.depth);
   const best = roots[0] || null;
+
+  // If the collector has already returned to Pragmatic Roulette lobby, there
+  // will be multiple roulette table cards and no Automatic Play/SON500 panel.
+  // Report this so Python can clear a stale wait and immediately click next.
+  const lobbyTileSelector = [
+    '[data-gameid]','[data-game-id]','[data-table-id]','[data-tableid]',
+    '[data-testid="wow-tile"]','[data-testid*="tile" i]',
+    '[data-testid*="game" i]','[data-testid*="table" i]',
+    '[class*="tile" i]','[class*="card" i]','[class*="game" i]'
+  ].join(',');
+  let lobbyCardCount = 0;
+  try {
+    const seenCards = new Set();
+    for (const el of deepQueryAll(document, lobbyTileSelector)) {
+      if (!visibleStyle(el)) continue;
+      const txt = norm(readableText(el));
+      const hasId = !!(el.getAttribute('data-gameid') || el.getAttribute('data-game-id') || el.getAttribute('data-table-id') || el.getAttribute('data-tableid'));
+      if (!hasId && !/(ROULETTE|RULET)/.test(txt)) continue;
+      if (/BLACKJACK|BACCARAT|POKER|HISTORY|SON\s*500|LAST\s*500|OTOMAT|AUTOMATIC/.test(txt)) continue;
+      const key = (txt.slice(0,80) + '|' + (el.getAttribute('data-gameid') || el.getAttribute('data-table-id') || '')).slice(0,140);
+      if (seenCards.has(key)) continue;
+      seenCards.add(key);
+      lobbyCardCount += 1;
+    }
+  } catch (_) {}
+  const bodyT = norm(readableText(document.body || document.documentElement));
+  const titleT = norm(document.title || '');
+  const lobbyLike = !autoFound && !best && (
+    lobbyCardCount >= 3 ||
+    (/\bRULET\b|\bROULETTE\b/.test(bodyT) && /STANDART|TURKCE|TÜRKÇE|HIZLI|PRIVE|PRIVÉ|VERSIYON/.test(bodyT) && lobbyCardCount >= 1)
+  );
+  const hasInGameLobbyButton = all.some(el => {
+    try {
+      if (!visibleStyle(el)) return false;
+      const r = el.getBoundingClientRect();
+      const t = norm([readableText(el), el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title')].join(' '));
+      return /\b(LOBI|LOBBY)\b/.test(t) && r.top <= innerHeight * 0.24 && r.left >= innerWidth * 0.50;
+    } catch (_) { return false; }
+  });
+  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS/.test(bodyT);
+  const hasHotColdPanel = /SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD/.test(bodyT);
+  const blockedTable = /POWER\s*UP\s*(RULET|ROULETTE|ROULET)?|POWERUP\s*(RULET|ROULETTE|ROULET)?/.test(titleT + ' ' + bodyT);
+  const hotColdOnly = hasInGameLobbyButton && activeGameUi && hasHotColdPanel && !tab;
+  const gameNoSon500 = blockedTable || hotColdOnly;
 
   return {
     title: document.title,
     url: location.href,
     expandedDrawer,
     foundTab: !!tab,
+    autoFound,
+    lobbyLike,
+    lobbyCardCount,
+    blockedTable,
+    hotColdOnly,
+    gameNoSon500,
+    source: best ? (best.source || '') : '',
     count: best ? best.nums.length : 0,
     nums: best ? best.nums.slice(0, 500) : []
   };
 })()
 """
 
+COLLECTOR_LOBBY_CLICK_SCRIPT = r"""
+(() => {
+  const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[İı]/g, 'I').replace(/\s+/g, ' ').trim().toUpperCase();
+  const visible = el => {
+    try {
+      const s = getComputedStyle(el), r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4 &&
+             s.display !== 'none' && s.visibility !== 'hidden' &&
+             Number(s.opacity || 1) !== 0;
+    } catch (_) { return false; }
+  };
+  function deepAll(root, selector) {
+    const out = [];
+    const seenRoots = new Set();
+    const add = el => { if (el && !out.includes(el)) out.push(el); };
+    function walk(r) {
+      if (!r || seenRoots.has(r)) return;
+      seenRoots.add(r);
+      let nodes = [];
+      try { nodes = Array.from(r.querySelectorAll(selector)); } catch (_) { nodes = []; }
+      for (const n of nodes) add(n);
+      let all = [];
+      try { all = Array.from(r.querySelectorAll('*')); } catch (_) { all = []; }
+      for (const el of all) {
+        try { if (el.shadowRoot) walk(el.shadowRoot); } catch (_) {}
+        try {
+          if (String(el.tagName || '').toUpperCase() === 'IFRAME' && el.contentDocument) walk(el.contentDocument);
+        } catch (_) {}
+      }
+    }
+    walk(root);
+    return out;
+  }
+  function metaText(el) {
+    const vals = [];
+    try { vals.push(el.innerText || ''); } catch (_) {}
+    try { vals.push(el.textContent || ''); } catch (_) {}
+    for (const a of ['aria-label','title','alt','data-testid','data-test','id','class']) {
+      try { vals.push(el.getAttribute(a) || ''); } catch (_) {}
+    }
+    return vals.join(' ');
+  }
+  function clickIt(el) {
+    try { el.scrollIntoView({block:'center', inline:'center'}); } catch (_) {}
+    try {
+      for (const t of ['pointerover','mouseover','mouseenter','mousemove','pointerdown','mousedown','pointerup','mouseup']) {
+        el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}));
+      }
+    } catch (_) {}
+    try { el.click(); return true; } catch (_) { return false; }
+  }
+  function clickable(el) {
+    let p = el;
+    for (let i = 0; i < 7 && p; i++, p = p.parentElement) {
+      try {
+        if (p.matches && p.matches('button,a,[role="button"],[tabindex]')) return p;
+        if (p.onclick || getComputedStyle(p).cursor === 'pointer') return p;
+      } catch (_) {}
+    }
+    return el;
+  }
 
-def build_multi_table_nav_scan():
+  const candidates = deepAll(document, 'button,a,[role="button"],[tabindex],div,span');
+  const scored = [];
+  for (const el of candidates) {
+    if (!visible(el)) continue;
+    const hit = clickable(el);
+    if (!hit || !visible(hit)) continue;
+    const r = hit.getBoundingClientRect();
+    const text = norm(metaText(el) + ' ' + metaText(hit));
+    let score = 0;
+    if (/\b(LOBI|LOBBY)\b/.test(text)) score += 300;
+    if (/PRAGMATIC\s*(PLAY)?\s*(LOBI|LOBBY)/.test(text)) score += 80;
+    if (r.top <= innerHeight * 0.24) score += 55;
+    if (r.left >= innerWidth * 0.55) score += 55;
+    if (r.width >= 35 && r.width <= 180 && r.height >= 24 && r.height <= 90) score += 30;
+    if (/ARAMA|SEARCH|OYUN\s*ARA|BAHIS|BET|SPIN|OTOMAT|AUTOMATIC|CHAT|SOUND|SES|AYAR|SETTING|GECMIS|HISTORY|SON\s*500|LAST\s*500/.test(text)) score -= 220;
+    if (score >= 260) scored.push({el:hit, score, text:text.slice(0,80), x:Math.round(r.x), y:Math.round(r.y)});
+  }
+  scored.sort((a,b) => b.score - a.score || b.x - a.x);
+  if (scored.length) {
+    const ok = clickIt(scored[0].el);
+    return {
+      ok,
+      clicked: ok,
+      stage: 'in-game-lobby-button',
+      text: scored[0].text,
+      title: document.title || '',
+      url: location.href
+    };
+  }
+
+  // Fallback inside the same game UI: the round back arrow next to the Lobi
+  // button usually goes to the Pragmatic lobby too. Do NOT navigate to the
+  // operator search page from here.
+  const backScored = [];
+  for (const el of candidates) {
+    if (!visible(el)) continue;
+    const hit = clickable(el);
+    if (!hit || !visible(hit)) continue;
+    const r = hit.getBoundingClientRect();
+    const text = norm(metaText(el) + ' ' + metaText(hit));
+    let score = 0;
+    if (/\b(BACK|GERI|GERİ|ARROW|CHEVRON|CLOSE|KAPAT)\b/.test(text)) score += 120;
+    if (r.top <= innerHeight * 0.22) score += 45;
+    if (r.left >= innerWidth * 0.50) score += 35;
+    if (r.width >= 24 && r.width <= 75 && r.height >= 24 && r.height <= 75) score += 35;
+    if (/CHAT|SOUND|SES|AYAR|SETTING|LOBI|LOBBY/.test(text)) score -= 40;
+    if (score >= 170) backScored.push({el:hit, score, text:text.slice(0,80), x:Math.round(r.x), y:Math.round(r.y)});
+  }
+  backScored.sort((a,b) => b.score - a.score || b.x - a.x);
+  if (backScored.length) {
+    const ok = clickIt(backScored[0].el);
+    return {
+      ok,
+      clicked: ok,
+      stage: 'in-game-back-button',
+      text: backScored[0].text,
+      title: document.title || '',
+      url: location.href
+    };
+  }
+
+  return {
+    ok: false,
+    clicked: false,
+    stage: 'lobby-button-not-found',
+    title: document.title || '',
+    url: location.href
+  };
+})()
+"""
+
+
+def build_multi_table_nav_scan(clicked_keys=None, click_cards=True):
+    clicked_json = json.dumps(
+        [str(x) for x in list(clicked_keys or [])[:2500]],
+        ensure_ascii=False,
+    )
+    blocked_json = json.dumps(
+        [str(x) for x in TAB_WALK_BLOCKED_TABLE_LABELS],
+        ensure_ascii=False,
+    )
+    click_cards_json = json.dumps(bool(click_cards))
     return rf"""
 (() => {{
   const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[İı]/g, 'I').replace(/\s+/g, ' ').trim().toUpperCase();
+  const PY_CLICKED_KEYS = new Set({clicked_json});
+  const PY_BLOCKED_TABLE_LABELS = {blocked_json};
+  const blockedLabel = s => {{
+    const t = norm(s || '');
+    return PY_BLOCKED_TABLE_LABELS.some(b => b && t.includes(b));
+  }};
+  const PY_CLICK_CARDS = {click_cards_json};
   const visible = el => {{
     if (!el) return false;
     const r=el.getBoundingClientRect(), s=getComputedStyle(el);
@@ -6253,13 +7275,156 @@ def build_multi_table_nav_scan():
     || path.includes('/apps/lobby/')
     || norm(title).includes('PRAGMATIC PLAY LOBBY');
 
+  function hoverAndClick(el) {{
+    if (!el) return false;
+    try {{ el.scrollIntoView({{block:'center', inline:'center'}}); }} catch (_) {{}}
+    try {{
+      for (const type of ['mouseover','mouseenter','mousemove']) {{
+        el.dispatchEvent(new MouseEvent(type, {{bubbles:true, cancelable:true, view:window}}));
+      }}
+    }} catch (_) {{}}
+    try {{ el.click(); return true; }} catch (_) {{ return false; }}
+  }}
+
+  function operatorLobbyLauncher() {{
+    const lobbyRe=/PRAGMATIC\s*PLAY\s*LOBBY/;
+    const playRe=/\b(OYNA|PLAY|OPEN|AÇ|AC|BAŞLAT|BASLAT|GİR|GIR|ENTER)\b/;
+    const tileSel='[data-testid*="tile" i],[data-testid*="game" i],[class*="card" i],[class*="game" i],[class*="tile" i],article,section';
+    const raw=Array.from(document.querySelectorAll(tileSel+',button,a,[role="button"]')).filter(visible);
+    const tiles=[];
+    const seenTiles=new Set();
+    for (const el of raw) {{
+      const tile=(el.closest && el.closest(tileSel)) || el;
+      if (!tile || !visible(tile) || seenTiles.has(tile)) continue;
+      seenTiles.add(tile);
+      tiles.push(tile);
+    }}
+    for (const tile of tiles) {{
+      const text=norm([
+        tile.innerText,tile.textContent,
+        tile.getAttribute && tile.getAttribute('aria-label'),
+        tile.getAttribute && tile.getAttribute('title'),
+        tile.getAttribute && tile.getAttribute('data-testid')
+      ].join(' '));
+      if (!lobbyRe.test(text)) continue;
+      if (/BLACKJACK|BACCARAT|POKER|SLOT|SWEET|BONANZA/.test(text)) continue;
+      try {{
+        tile.dispatchEvent(new MouseEvent('mouseover', {{bubbles:true, cancelable:true, view:window}}));
+        tile.dispatchEvent(new MouseEvent('mouseenter', {{bubbles:true, cancelable:true, view:window}}));
+      }} catch (_) {{}}
+      const buttons=Array.from(tile.querySelectorAll('button,a,[role="button"],[tabindex]')).filter(visible);
+      const play=buttons.find(b => playRe.test(norm([
+        b.innerText,b.textContent,
+        b.getAttribute && b.getAttribute('aria-label'),
+        b.getAttribute && b.getAttribute('title')
+      ].join(' ')))) || null;
+      const hit=play || clickable(tile) || tile;
+      if (hoverAndClick(hit)) {{
+        return {{
+          ok:true,mode:'navigating',stage:'pragmatic-lobby-card-play',
+          clickedLabel:text.slice(0,120),title,url:href
+        }};
+      }}
+    }}
+
+    // If the search result has not loaded yet, actively type the exact term
+    // shown in the user's screenshot into the casino search field.
+    const inputs=Array.from(document.querySelectorAll('input,textarea,[contenteditable="true"],[role="searchbox"]')).filter(visible);
+    const search=inputs.find(el => {{
+      const meta=norm([
+        el.getAttribute && el.getAttribute('placeholder'),
+        el.getAttribute && el.getAttribute('aria-label'),
+        el.getAttribute && el.getAttribute('title'),
+        el.getAttribute && el.getAttribute('name'),
+        el.id, typeof el.className==='string'?el.className:''
+      ].join(' '));
+      return /ARA|ARAMA|SEARCH|FIND|GAME|OYUN/.test(meta)
+        || String(el.type||'').toLowerCase()==='search';
+    }}) || null;
+    if (search) {{
+      try {{
+        const wanted='pragmatic play lobby';
+        const cur=String(search.value || search.textContent || '').toLowerCase();
+        if (!cur.includes('pragmatic')) {{
+          search.focus();
+          if ('value' in search) search.value=wanted;
+          else search.textContent=wanted;
+          search.dispatchEvent(new Event('input', {{bubbles:true}}));
+          search.dispatchEvent(new Event('change', {{bubbles:true}}));
+          search.dispatchEvent(new KeyboardEvent('keyup', {{bubbles:true,key:'Enter',code:'Enter'}}));
+          return {{ok:true,mode:'navigating',stage:'pragmatic-lobby-search-typed',title,url:href}};
+        }}
+      }} catch (_) {{}}
+    }}
+    return null;
+  }}
+
   if (!providerContext) {{
+    const launched=operatorLobbyLauncher();
+    if (launched) return launched;
     return {{ok:true,mode:'waiting',stage:'provider-context',title,url:href}};
   }}
 
   const visibleControls=Array.from(document.querySelectorAll(
     'button,a,[role="button"],[tabindex],div,span'
   )).filter(visible);
+
+  // V2.9.42: if a real game overlay is visible, stop before the
+  // generic lobby/card scanner. Some operators keep the lobby DOM behind the
+  // table; the presence of visible SON500 or the in-game Lobi button is more
+  // important than stale lobby cards.
+  const hasSon500Control = visibleControls.some(el => {{
+    const t = norm([
+      el.innerText, el.textContent,
+      el.getAttribute && el.getAttribute('aria-label'),
+      el.getAttribute && el.getAttribute('title'),
+      el.getAttribute && el.getAttribute('data-testid')
+    ].join(' '));
+    return /\b(SON|LAST)\s*500\b/.test(t);
+  }});
+  const hasInGameLobbyButton = visibleControls.some(el => {{
+    const r = el.getBoundingClientRect();
+    const t = norm([
+      el.innerText, el.textContent,
+      el.getAttribute && el.getAttribute('aria-label'),
+      el.getAttribute && el.getAttribute('title'),
+      el.getAttribute && el.getAttribute('data-testid')
+    ].join(' '));
+    return /\b(LOBI|LOBBY)\b/.test(t) && r.top <= innerHeight * 0.28 && r.left >= innerWidth * 0.45;
+  }});
+  const activeGameUi = /SONRAKI\s+OYUNU\s+BEKLEYIN|WAIT\s+FOR\s+NEXT\s+GAME|BAKIYE|BALANCE|TOPLAM\s+BAHIS|TOTAL\s+BET|SICAK\s*&\s*SOGUK|SICAK\s*&\s*SOĞUK|HOT\s*&\s*COLD|KAZANCI|WINNINGS|JEU\s*0|VOISINS|ORPHELINS|TIERS|OTOMATIK\s+OYUN|AUTOMATIC\s+PLAY/.test(bodyText);
+  const blockedActiveTable = blockedLabel(title + ' ' + bodyText);
+  const gameOverlayLikely = hasInGameLobbyButton || (hasSon500Control && /BAKIYE|BALANCE|OTOMATIK|AUTOMATIC|BAHIS|BET|SICAK|HOT|VOISINS|TIERS|ORPHELINS|JEU/.test(bodyText));
+  if (gameOverlayLikely) {{
+    if (blockedActiveTable) {{
+      return {{
+        ok:true,
+        mode:'game_blocked',
+        stage:'active-game-blocked',
+        title,url:href,
+        reason:'bloklu masa'
+      }};
+    }}
+    if (hasSon500Control) {{
+      return {{
+        ok:true,
+        mode:'game_has_son500',
+        stage:'active-game-has-son500',
+        title,url:href,
+        reason:'SON500 paneli var'
+      }};
+    }}
+    if (activeGameUi) {{
+      return {{
+        ok:true,
+        mode:'game_no_son500',
+        stage:'active-game-no-son500',
+        title,url:href,
+        reason:'SON500 paneli yok'
+      }};
+    }}
+  }}
+
   const categoryLabels=new Set(['RULET','ROULETTE','RULET MASALARI','ROULETTE TABLES']);
   const category=visibleControls.map(el => {{
     const label=norm(el.innerText || el.textContent);
@@ -6270,7 +7435,12 @@ def build_multi_table_nav_scan():
   }}).find(Boolean);
 
   const scanState=window.__rouletteLobbyScanState
-    || (window.__rouletteLobbyScanState={{menuAttemptAt:0,categoryAttemptAt:0}});
+    || (window.__rouletteLobbyScanState={{
+      menuAttemptAt:0,
+      categoryAttemptAt:0,
+      categoryAttempts:0,
+      categoryFirstSeenAt:0
+    }});
   const selected=el => {{
     if (!el) return false;
     const cls=String(el.className && el.className.baseVal || el.className || '');
@@ -6281,17 +7451,29 @@ def build_multi_table_nav_scan():
       || /(^|[\s_-])(active|selected|current|checked)([\s_-]|$)/i.test(cls);
   }};
 
+  let categoryState = 'missing';
   if (category) {{
-    if (!selected(category)) {{
-      if (Date.now()-scanState.categoryAttemptAt>=3500) {{
+    if (selected(category)) {{
+      categoryState = 'selected';
+    }} else {{
+      categoryState = 'unconfirmed';
+      if (!scanState.categoryFirstSeenAt) scanState.categoryFirstSeenAt = Date.now();
+      if (Date.now()-scanState.categoryAttemptAt>=3500 && (scanState.categoryAttempts||0) < 4) {{
         try {{
           category.click();
           scanState.categoryAttemptAt=Date.now();
+          scanState.categoryAttempts=(scanState.categoryAttempts||0)+1;
         }} catch (e) {{
           return {{ok:false,mode:'waiting',stage:'roulette-click-failed',reason:String(e)}};
         }}
+        return {{
+          ok:true,mode:'navigating',stage:'roulette-selecting',
+          attempts:scanState.categoryAttempts,title,url:href
+        }};
       }}
-      return {{ok:true,mode:'navigating',stage:'roulette-selecting',title,url:href}};
+      // Some Pragmatic lobby builds never mark the category as selected.
+      // After a few clicks, continue with visible roulette cards instead of
+      // getting stuck forever in "roulette-selecting".
     }}
   }} else if (Date.now()-scanState.menuAttemptAt>=5000) {{
     const menuWords=/MENU|CATEGORY|CATEGORIES|SIDEBAR|DRAWER|EXPAND|COLLAPSE|NAVIGATION|ARROW|CHEVRON/;
@@ -6322,39 +7504,148 @@ def build_multi_table_nav_scan():
   }}
 
   const cards=[];
+  const cardHits=[];
   const seen=new Set();
-  for (const el of document.querySelectorAll('div,span,a,button')) {{
-    if (!visible(el)) continue;
-    const text=norm(el.innerText || el.textContent);
-    if (!text || text.length>180 || !/(ROULETTE|RULET)/.test(text)) continue;
-    if (/TOURNAMENT|HISTORY|SON 500|LAST 500|BLACKJACK|BACCARAT|POKER/.test(text)) continue;
-    if (categoryLabels.has(text)) continue;
-    const tile=el.closest && el.closest(
-      '[data-testid="wow-tile"],[data-testid*="tile" i],[class*="tile" i]'
-    );
-    const hit=tile || clickable(el);
-    if (!hit || !visible(hit) || seen.has(hit)) continue;
-    const label=norm(hit.innerText || hit.textContent);
-    if (!/(ROULETTE|RULET)/.test(label) || label.length>260) continue;
-    seen.add(hit);
-    const href=String(hit.href || hit.getAttribute('href') || '');
-    const testid=String(hit.getAttribute('data-testid') || '');
-    const attrs=Array.from(hit.attributes || []);
-    let tableId=String(
-      hit.getAttribute('data-table-id') || hit.getAttribute('data-tableid') || ''
-    );
-    if (!tableId) {{
-      const idAttr=attrs.find(a => /^(data-)?table[_-]?id$/i.test(a.name));
-      if (idAttr) tableId=String(idAttr.value || '');
-    }}
-    if (!tableId && href) {{
+  const badCardText=/TOURNAMENT|HISTORY|SON 500|LAST 500|BLACKJACK|BACCARAT|POKER|AUTO PLAY|OTOMATIK OYUN|BAHIS|BET|CHIP|ÇIP/;
+  function attrAny(el,names) {{
+    for (const n of names) {{
       try {{
-        const u=new URL(href,location.href);
-        tableId=u.searchParams.get('tableId') || u.searchParams.get('table_id') || '';
+        const v=el.getAttribute(n);
+        if (v) return String(v).trim();
       }} catch (_) {{}}
     }}
-    const key=(label+'|'+href+'|'+testid).slice(0,420);
-    cards.push({{key,label,href,testid,table_id:tableId}});
+    return '';
+  }}
+  function firstAttrInTree(el,names) {{
+    let p=el;
+    for(let i=0;i<6 && p;i++,p=p.parentElement) {{
+      const v=attrAny(p,names);
+      if (v) return v;
+    }}
+    return '';
+  }}
+  function hrefOf(el) {{
+    let p=el;
+    for(let i=0;i<6 && p;i++,p=p.parentElement) {{
+      const h=String(p.href || p.getAttribute && (
+        p.getAttribute('href') || p.getAttribute('data-href') ||
+        p.getAttribute('data-url') || p.getAttribute('data-launch-url') ||
+        p.getAttribute('data-game-url') || ''
+      ) || '').trim();
+      if (h) {{
+        try {{ return new URL(h, location.href).toString(); }} catch (_) {{ return h; }}
+      }}
+    }}
+    return '';
+  }}
+
+  const tileSelector=[
+    '[data-gameid]','[data-game-id]','[data-table-id]','[data-tableid]',
+    '[data-testid="wow-tile"]','[data-testid*="tile" i]',
+    '[data-testid*="game" i]','[data-testid*="table" i]',
+    '[class*="tile" i]','[class*="card" i]','[class*="game" i]'
+  ].join(',');
+  const candidates=Array.from(document.querySelectorAll(tileSelector));
+  if (!candidates.length) candidates.push(...Array.from(document.querySelectorAll('a,button,[role="button"],div,span')));
+
+  const rouletteHeading=Array.from(document.querySelectorAll('h1,h2,h3,[role="heading"]'))
+    .some(el => visible(el) && /^(RULET|ROULETTE)$/.test(norm(el.innerText || el.textContent)));
+  const rouletteContext = rouletteHeading
+    || categoryState === 'selected'
+    || (path.includes('/apps/lobby/') && /\b(RULET|ROULETTE)\b/.test(bodyText));
+
+  for (const raw of candidates.slice(0,3500)) {{
+    if (!visible(raw)) continue;
+    const tile=raw.closest && raw.closest(tileSelector) || raw;
+    if (!visible(tile)) continue;
+
+    let tableId=firstAttrInTree(tile, ['data-table-id','data-tableid','tableid','table-id','data-table_id']);
+    let gameId=firstAttrInTree(tile, ['data-gameid','data-game-id','gameid','game-id','data-game_id']);
+    const text=norm([
+      tile.innerText,tile.textContent,raw.innerText,raw.textContent,
+      tile.getAttribute && tile.getAttribute('aria-label'),
+      tile.getAttribute && tile.getAttribute('title')
+    ].join(' '));
+    const textLooksRoulette=/(ROULETTE|RULET)/.test(text);
+    if ((!text && !tableId && !gameId) || text.length>520) continue;
+    if (blockedLabel(text)) continue;
+    if (!textLooksRoulette && !(rouletteContext && (tableId || gameId))) continue;
+    if (badCardText.test(text)) continue;
+    if (categoryLabels.has(text)) continue;
+
+    const hit=clickable(tile) || tile;
+    if (!hit || !visible(hit)) continue;
+    let label=norm([
+      hit.innerText,hit.textContent,text,
+      hit.getAttribute && hit.getAttribute('aria-label'),
+      hit.getAttribute && hit.getAttribute('title')
+    ].join(' ')).slice(0,260);
+    if (blockedLabel(label)) continue;
+    if (!/(ROULETTE|RULET)/.test(label) && !(rouletteContext && (gameId || tableId))) continue;
+    if (badCardText.test(label)) continue;
+
+    let href=hrefOf(hit) || hrefOf(tile);
+    const testid=String(hit.getAttribute && hit.getAttribute('data-testid') || tile.getAttribute && tile.getAttribute('data-testid') || '');
+    tableId = tableId || firstAttrInTree(hit, ['data-table-id','data-tableid','tableid','table-id','data-table_id']);
+    gameId = gameId || firstAttrInTree(hit, ['data-gameid','data-game-id','gameid','game-id','data-game_id']);
+
+    if (href) {{
+      try {{
+        const u=new URL(href,location.href);
+        tableId = tableId || u.searchParams.get('tableId') || u.searchParams.get('table_id') || '';
+        gameId = gameId || u.searchParams.get('gameId') || u.searchParams.get('game_id') || u.searchParams.get('openGames') || '';
+        href = u.toString();
+      }} catch (_) {{}}
+    }}
+
+    if (!label && (gameId || tableId)) label = 'ROULETTE ' + (gameId || tableId);
+    if (!/(ROULETTE|RULET)/.test(label) && rouletteContext && gameId) {{
+      label = ('ROULETTE ' + gameId + ' ' + label).trim().slice(0,260);
+    }}
+
+    const key=(tableId || gameId || href || label+'|'+testid).slice(0,420);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    cards.push({{key,label,href,testid,table_id:tableId,game_id:gameId}});
+    cardHits.push({{key,label,hit}});
+  }}
+
+  if (!scanState.clickedKeys) scanState.clickedKeys = {{}};
+  const nowMs = Date.now();
+  const clickReady = nowMs - Number(scanState.lastCardClickAt || 0) >= 700;
+  if (PY_CLICK_CARDS && cardHits.length && clickReady) {{
+    const next = cardHits.find(c => !PY_CLICKED_KEYS.has(c.key) && !scanState.clickedKeys[c.key]);
+    if (next) {{
+      scanState.clickedKeys[next.key] = nowMs;
+      scanState.lastCardClickAt = nowMs;
+      try {{
+        next.hit.scrollIntoView({{block:'center', inline:'center'}});
+      }} catch (_) {{}}
+      try {{
+        try {{ performance.clearResourceTimings(); }} catch (_) {{}}
+        next.hit.click();
+        return {{
+          ok:true,
+          mode:'card_clicked',
+          stage:'card-clicked',
+          clickedKey:next.key,
+          clickedLabel:next.label,
+          cards,
+          title,url:href
+        }};
+      }} catch (e) {{
+        return {{
+          ok:false,
+          mode:'provider_lobby',
+          stage:'card-click-failed',
+          clickedKey:next.key,
+          clickedLabel:next.label,
+          reason:String(e),
+          cards,
+          title,url:href
+        }};
+      }}
+    }}
   }}
 
   const scrollCandidates=[];
@@ -6379,7 +7670,11 @@ def build_multi_table_nav_scan():
     scrollHeight=scrollTarget.scrollHeight;
     clientHeight=scrollTarget.clientHeight;
     atBottom=scrollTop+clientHeight>=scrollHeight-8;
-    if (!atBottom) {{
+    if (atBottom) scanState.atBottomSeen = true;
+    // V2.9.16: after the scanner reaches bottom once, do not force-scroll
+    // down again. This lets the user manually scroll upward without the
+    // program pulling the lobby back to the bottom.
+    if (!atBottom && !scanState.atBottomSeen) {{
       scrollTarget.scrollBy({{top:Math.max(360,Math.floor(clientHeight*0.72)),behavior:'instant'}});
     }}
   }}
@@ -6387,13 +7682,578 @@ def build_multi_table_nav_scan():
   return {{
     ok:true,
     mode:'provider_lobby',
-    stage:category?(selected(category)?'roulette-selected':'roulette-selecting'):'scanning',
+    stage:category?(categoryState==='selected'?'roulette-selected':'roulette-unconfirmed'):'scanning',
     cards,
     scrollTop,scrollHeight,clientHeight,atBottom,
+    atBottomSeen: !!scanState.atBottomSeen,
     bodyLength:bodyText.length,
     title,url:href
   }};
 }})()
+"""
+
+
+def _dga_last20_numbers(last20):
+    nums = []
+    if not isinstance(last20, list):
+        return nums
+    for item in last20:
+        val = None
+        if isinstance(item, dict):
+            for key in ("result", "number", "value", "winningNumber"):
+                if key in item:
+                    val = item.get(key)
+                    break
+        else:
+            val = item
+        try:
+            n = int(val)
+        except Exception:
+            continue
+        if 0 <= n <= 36:
+            nums.append(n)
+    return nums
+
+
+def extract_dga_feed_tables(payload):
+    """Return [{table_id, display_name, nums}] from Pragmatic DGA websocket JSON."""
+    rows = []
+    seen = set()
+
+    def add(tid, name, nums):
+        tid = str(tid or "").strip()
+        if not tid or len(nums or []) < 1:
+            return
+        key = (tid, tuple(nums[:20]))
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({
+            "table_id": tid,
+            "display_name": str(name or tid).strip() or tid,
+            "nums": list(nums),
+        })
+
+    def walk(obj, hinted_tid="", hinted_name=""):
+        if isinstance(obj, dict):
+            table_obj = obj.get("pragmaticTable")
+            if isinstance(table_obj, dict):
+                tid_hint = hinted_tid
+                tcid = str(obj.get("tableAndCurrencyID") or "")
+                if tcid and not tid_hint:
+                    tid_hint = tcid.split(":", 1)[0]
+                walk(table_obj, tid_hint, hinted_name)
+
+            tid = str(
+                obj.get("tableId")
+                or obj.get("tableID")
+                or obj.get("table_id")
+                or hinted_tid
+                or ""
+            ).strip()
+            name = str(
+                obj.get("tableName")
+                or obj.get("table_name")
+                or obj.get("name")
+                or obj.get("languageSpecificTableInfo")
+                or hinted_name
+                or tid
+            ).strip()
+            nums = _dga_last20_numbers(obj.get("last20Results"))
+            if tid and nums:
+                add(tid, name, nums)
+
+            # Some delta frames nest the actual table state below generic keys.
+            for key, val in obj.items():
+                if key in (
+                    "pragmaticTable",
+                    "last20Results",
+                    "tableLimits",
+                    "dealer",
+                ):
+                    continue
+                if isinstance(val, (dict, list)):
+                    walk(val, tid or hinted_tid, name or hinted_name)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, hinted_tid, hinted_name)
+
+    walk(payload)
+    return rows
+
+
+class DgaLiveFeedCollector(threading.Thread):
+    def __init__(self, state):
+        super().__init__(daemon=True, name="PragmaticDgaLiveFeed")
+        self.state = state
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.enabled = False
+        self.ws_url = DGA_FEED_WS_URL
+        self.casino_id = ""
+        self.currency = ""
+        self.reason = ""
+        self.last_keys = {}
+        self.updated_tables = set()
+        self.received_frames = 0
+        self.connected = False
+        self.last_error = ""
+        self.individual_mode = False
+        self.currency_cycle = list(dict.fromkeys([
+            DGA_DEFAULT_CURRENCY, "USD", "EUR", "BRL", "CAD"
+        ]))
+        self.currency_index = 0
+
+    def configure(self, casino_id="", currency="", ws_url="", enable=True, reason=""):
+        with self.lock:
+            if casino_id:
+                self.casino_id = str(casino_id).strip()
+            if currency:
+                self.currency = str(currency).strip().upper()
+            if ws_url:
+                self.ws_url = str(ws_url).strip()
+            self.enabled = bool(enable)
+            if reason:
+                self.reason = str(reason)
+        if not self.is_alive():
+            try:
+                self.start()
+            except RuntimeError:
+                pass
+        self._set_status("DGA CANLI: başlatıldı • websocket bağlantısı hazırlanıyor")
+        return True
+
+    def stop_collection(self, reason="kullanıcı durdurdu"):
+        with self.lock:
+            self.enabled = False
+            self.connected = False
+        self._set_status(f"DGA CANLI: durdu • {reason}")
+
+    def _config(self):
+        with self.lock:
+            explicit_currency = bool(str(self.currency or "").strip())
+            cur = (
+                self.currency
+                if explicit_currency
+                else self.currency_cycle[self.currency_index % len(self.currency_cycle)]
+            )
+            return {
+                "enabled": bool(self.enabled),
+                "ws_url": self.ws_url or DGA_FEED_WS_URL,
+                "casino_id": self.casino_id or DGA_DEFAULT_CASINO_ID,
+                "currency": cur or DGA_DEFAULT_CURRENCY,
+                "explicit_currency": explicit_currency,
+                "reason": self.reason,
+            }
+
+    def _table_rows(self):
+        with self.state.lock:
+            rows = dict(getattr(self.state, "table_registry", {}) or {})
+        out = []
+        seen = set()
+        for tid, row in rows.items():
+            tid = str(tid or "").strip()
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append({
+                "table_id": tid,
+                "display_name": str((row or {}).get("display_name") or tid),
+            })
+        out.sort(key=lambda r: r["display_name"].lower())
+        return out
+
+    def _set_status(self, text):
+        try:
+            with self.state.lock:
+                self.state.table_scan_status = str(text)[:220]
+        except Exception:
+            pass
+
+    def _send_subscribe(self, ws, rows, casino_id, currency, individual=False):
+        ids = [str(r.get("table_id") or "").strip() for r in rows]
+        ids = [x for x in ids if x]
+        if not ids:
+            return 0
+        sent = 0
+        # Pragmatic examples differ: some use key:"tableId", some use
+        # key:["tableId"]. Large multi-key batches caused ConnectionResetError
+        # for the user's operator, so the fallback path now sends one table per
+        # subscribe frame.
+        for tid in ids:
+            msg = {
+                "type": "subscribe",
+                "isDeltaEnabled": True,
+                "casinoId": casino_id,
+                "key": [tid] if individual else tid,
+                "currency": currency,
+            }
+            ws.send_text(json.dumps(msg, separators=(",", ":")))
+            sent += 1
+        return sent
+
+    def _handle_payload(self, payload, display_names=None):
+        rows = extract_dga_feed_tables(payload)
+        if not rows:
+            return 0
+        display_names = display_names or {}
+        applied = 0
+        now = time.time()
+        for row in rows:
+            tid = str(row.get("table_id") or "").strip()
+            nums = [int(x) for x in (row.get("nums") or []) if isinstance(x, int)]
+            if not tid or len(nums) < 3:
+                continue
+            key = tuple(nums[:20])
+            if self.last_keys.get(tid) == key:
+                continue
+            self.last_keys[tid] = key
+            name = str(row.get("display_name") or display_names.get(tid) or tid)
+            if len(nums) >= 20:
+                self.state.store_background_table_history(
+                    nums,
+                    table_id=tid,
+                    display_name=name,
+                    source_label="DGA WebSocket liveFeed",
+                )
+            else:
+                self.state.mark_table_discovered(tid, name, source="DGA WebSocket")
+            self.state.mark_table_attempt(tid, ok=True)
+            self.updated_tables.add(tid)
+            applied += 1
+        if applied:
+            sample = rows[0]
+            self._set_status(
+                f"DGA CANLI: {len(self.updated_tables)} masa güncellendi • "
+                f"son {sample.get('display_name') or sample.get('table_id')} • "
+                f"{time.strftime('%H:%M:%S')}"
+            )
+        return applied
+
+    def run(self):
+        while not self.stop_event.is_set():
+            cfg = self._config()
+            if not cfg["enabled"]:
+                time.sleep(0.8)
+                continue
+
+            rows = self._table_rows()
+            if not rows:
+                self._set_status("DGA CANLI: kayıtlı masa bankası yok")
+                time.sleep(2.0)
+                continue
+
+            casino_id = str(cfg["casino_id"] or DGA_DEFAULT_CASINO_ID)
+            currency = str(cfg["currency"] or DGA_DEFAULT_CURRENCY).upper()
+            ws_url = str(cfg["ws_url"] or DGA_FEED_WS_URL)
+            display_names = {r["table_id"]: r["display_name"] for r in rows}
+            using_default = not bool((self.casino_id or "").strip())
+
+            ws = None
+            try:
+                self._set_status(
+                    f"DGA CANLI: bağlanıyor • {len(rows)} masa • "
+                    f"casino {casino_id}{' yedek' if using_default else ''} • {currency}"
+                )
+                ws = RawWebSocket(ws_url, connect_timeout=8)
+                ws.settimeout(2.0)
+                with self.lock:
+                    self.connected = True
+                    self.last_error = ""
+                    self.individual_mode = False
+                sent = self._send_subscribe(ws, rows, casino_id, currency, individual=False)
+                self._set_status(
+                    f"DGA CANLI: bağlı • {sent} masa abone • veri bekleniyor"
+                )
+                started = time.time()
+                last_ping = 0.0
+                last_any = time.time()
+                individual_sent = False
+                snapshot_ids = [r["table_id"] for r in rows]
+
+                while not self.stop_event.is_set() and self._config()["enabled"]:
+                    now = time.time()
+                    if now - started >= TABLE_SCAN_AUTO_REFRESH_SECONDS:
+                        break
+                    current_ids = [r["table_id"] for r in self._table_rows()]
+                    current_cfg = self._config()
+                    if (
+                        current_ids != snapshot_ids
+                        or str(current_cfg.get("casino_id") or DGA_DEFAULT_CASINO_ID) != casino_id
+                        or str(current_cfg.get("currency") or DGA_DEFAULT_CURRENCY).upper() != currency
+                        or str(current_cfg.get("ws_url") or DGA_FEED_WS_URL) != ws_url
+                    ):
+                        break
+                    if now - last_ping >= 15.0:
+                        try:
+                            ws.send_text(json.dumps({
+                                "type": "ping",
+                                "pingTime": int(now * 1000),
+                            }, separators=(",", ":")))
+                        except Exception:
+                            raise
+                        last_ping = now
+                    try:
+                        raw = ws.recv_text()
+                    except socket.timeout:
+                        if not individual_sent and now - last_any >= 20.0:
+                            sent2 = self._send_subscribe(
+                                ws,
+                                rows,
+                                casino_id,
+                                currency,
+                                individual=True,
+                            )
+                            individual_sent = True
+                            with self.lock:
+                                self.individual_mode = True
+                            self._set_status(
+                                f"DGA CANLI: toplu abonelik sessiz • "
+                                f"{sent2} masa tek tek deneniyor"
+                            )
+                        elif individual_sent and now - last_any >= 45.0 and not cfg.get("explicit_currency"):
+                            with self.lock:
+                                self.currency_index += 1
+                            self._set_status(
+                                "DGA CANLI: veri gelmedi • başka para birimi deneniyor"
+                            )
+                            break
+                        continue
+                    if not raw:
+                        continue
+                    last_any = time.time()
+                    with self.lock:
+                        self.received_frames += 1
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        continue
+                    self._handle_payload(payload, display_names=display_names)
+            except Exception as exc:
+                with self.lock:
+                    self.connected = False
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                self._set_status(
+                    f"DGA CANLI: bağlantı hatası • {type(exc).__name__} • tekrar denenecek"
+                )
+                time.sleep(DGA_RECONNECT_SECONDS)
+            finally:
+                with self.lock:
+                    self.connected = False
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                time.sleep(1.0)
+
+
+def build_chrome_dga_start_script(rows, casino_id="", currency="", ws_url=""):
+    rows_json = json.dumps(rows or [], ensure_ascii=False)
+    casino_json = json.dumps(str(casino_id or ""), ensure_ascii=False)
+    currency_json = json.dumps(str(currency or ""), ensure_ascii=False)
+    ws_json = json.dumps(str(ws_url or DGA_FEED_WS_URL), ensure_ascii=False)
+    return f"""
+(() => {{
+  const rows = {rows_json};
+  const cfg = {{
+    wsUrl: {ws_json} || 'wss://dga.pragmaticplaylive.net/ws',
+    casinoId: {casino_json} || '',
+    currency: ({currency_json} || '').toUpperCase()
+  }};
+  const norm = v => String(v == null ? '' : v).trim();
+  function storageBlob() {{
+    const out=[];
+    for (const store of [window.localStorage, window.sessionStorage]) {{
+      try {{
+        for (let i=0;i<store.length;i++) {{
+          const k=store.key(i);
+          if (!k) continue;
+          const v=store.getItem(k);
+          if (/(casino|currency|table|dga|pragmatic)/i.test(k+' '+String(v).slice(0,500))) {{
+            out.push(k+'='+String(v).slice(0,1000));
+          }}
+        }}
+      }} catch (_) {{}}
+    }}
+    return out.join('\n');
+  }}
+  const resourceBlob = (() => {{
+    try {{ return performance.getEntriesByType('resource').map(x => x.name || '').join('\n'); }}
+    catch (_) {{ return ''; }}
+  }})();
+  const allText = [location.href, document.title || '', resourceBlob, storageBlob()].join('\n');
+  function firstMatch(patterns) {{
+    for (const re of patterns) {{
+      const m = allText.match(re);
+      if (m && m[1]) return decodeURIComponent(String(m[1])).trim();
+    }}
+    return '';
+  }}
+  if (!cfg.casinoId) {{
+    cfg.casinoId = firstMatch([
+      /[?&]casinoId=([^&#\s]+)/i,
+      /[?&]casinoID=([^&#\s]+)/i,
+      /["']casinoId["']\s*[:=]\s*["']([^"']+)/i,
+      /["']casinoID["']\s*[:=]\s*["']([^"']+)/i,
+      /casinoId\s*[:=]\s*([A-Za-z0-9_-]{{6,}})/i
+    ]);
+  }}
+  if (!cfg.currency) {{
+    cfg.currency = firstMatch([
+      /[?&]currency=([^&#\s]+)/i,
+      /[?&]currencyId=([^&#\s]+)/i,
+      /["']currency["']\s*[:=]\s*["']([^"']+)/i,
+      /["']currencyId["']\s*[:=]\s*["']([^"']+)/i,
+      /currency\s*[:=]\s*([A-Z]{{3}})/i
+    ]).toUpperCase();
+  }}
+  if (!cfg.casinoId) cfg.casinoId = 'ppcds00000003709';
+  if (!cfg.currency) cfg.currency = 'TRY';
+
+  const ids = Array.from(new Set(rows.map(r => norm(r.table_id)).filter(Boolean)));
+  const old = window.__rouletteChromeDgaFeed;
+  try {{ if (old && old.pingTimer) clearInterval(old.pingTimer); }} catch (_) {{}}
+  try {{ if (old && old.ws) old.ws.close(); }} catch (_) {{}}
+
+  const state = window.__rouletteChromeDgaFeed = {{
+    ok: true,
+    mode: 'chrome-runtime-dga',
+    status: 'opening',
+    wsUrl: cfg.wsUrl,
+    casinoId: cfg.casinoId,
+    currency: cfg.currency,
+    ids,
+    sent: 0,
+    frames: 0,
+    errors: 0,
+    openedAt: 0,
+    closedAt: 0,
+    closeCode: 0,
+    closeReason: '',
+    lastError: '',
+    lastMessageAt: 0,
+    buffer: []
+  }};
+
+  function push(kind, data) {{
+    try {{
+      state.buffer.push(JSON.stringify({{__kind:kind, data, t:Date.now()}}));
+      if (state.buffer.length > 1000) state.buffer.splice(0, state.buffer.length - 1000);
+    }} catch (_) {{}}
+  }}
+  function sendSubscribe(ws, asArray) {{
+    for (const tid of ids) {{
+      const keyValue = asArray ? [tid] : tid;
+      ws.send(JSON.stringify({{
+        type: 'subscribe',
+        isDeltaEnabled: true,
+        casinoId: cfg.casinoId,
+        key: keyValue,
+        currency: cfg.currency
+      }}));
+      state.sent += 1;
+    }}
+  }}
+
+  try {{
+    const ws = new WebSocket(cfg.wsUrl);
+    state.ws = ws;
+    ws.onopen = () => {{
+      state.status = 'open';
+      state.openedAt = Date.now();
+      try {{ sendSubscribe(ws, false); }} catch (e) {{ state.lastError=String(e && e.message || e); }}
+      // Some Pragmatic builds/examples use key:[tableId]. Try that too after
+      // the string form, but only once and without closing the feed.
+      setTimeout(() => {{
+        try {{ if (ws.readyState === 1) sendSubscribe(ws, true); }} catch (e) {{}}
+      }}, 4500);
+      push('opened', {{sent: state.sent, casinoId: cfg.casinoId, currency: cfg.currency}});
+    }};
+    ws.onmessage = ev => {{
+      state.frames += 1;
+      state.lastMessageAt = Date.now();
+      if (typeof ev.data === 'string') {{
+        state.buffer.push(ev.data);
+        if (state.buffer.length > 1000) state.buffer.splice(0, state.buffer.length - 1000);
+      }}
+    }};
+    ws.onerror = ev => {{
+      state.errors += 1;
+      state.status = 'error';
+      state.lastError = String((ev && (ev.message || ev.type)) || 'websocket error');
+      push('error', state.lastError);
+    }};
+    ws.onclose = ev => {{
+      state.status = 'closed';
+      state.closedAt = Date.now();
+      state.closeCode = ev && ev.code || 0;
+      state.closeReason = ev && ev.reason || '';
+      push('closed', {{code:state.closeCode, reason:state.closeReason}});
+    }};
+    state.pingTimer = setInterval(() => {{
+      try {{
+        if (ws.readyState === 1) ws.send(JSON.stringify({{type:'ping', pingTime:Date.now()}}));
+      }} catch (_) {{}}
+    }}, 15000);
+  }} catch (e) {{
+    state.status = 'failed';
+    state.lastError = String(e && e.message || e || 'WebSocket failed');
+  }}
+
+  return {{
+    ok: true,
+    mode: 'chrome-runtime-dga',
+    status: state.status,
+    sent: state.sent,
+    tables: ids.length,
+    casinoId: state.casinoId,
+    currency: state.currency,
+    title: document.title || '',
+    url: location.href
+  }};
+}})()
+"""
+
+
+CHROME_DGA_POLL_SCRIPT = r"""
+(() => {
+  const st = window.__rouletteChromeDgaFeed;
+  if (!st) return {ok:false, reason:'Chrome DGA state yok', title:document.title||'', url:location.href};
+  const messages = [];
+  try { messages.push(...st.buffer.splice(0, 120)); } catch (_) {}
+  return {
+    ok: true,
+    mode: 'chrome-runtime-dga',
+    status: st.status || '',
+    readyState: st.ws ? st.ws.readyState : -1,
+    sent: st.sent || 0,
+    tables: (st.ids || []).length,
+    frames: st.frames || 0,
+    errors: st.errors || 0,
+    casinoId: st.casinoId || '',
+    currency: st.currency || '',
+    closeCode: st.closeCode || 0,
+    closeReason: st.closeReason || '',
+    lastError: st.lastError || '',
+    lastMessageAt: st.lastMessageAt || 0,
+    messages,
+    title: document.title || '',
+    url: location.href
+  };
+})()
+"""
+
+
+CHROME_DGA_STOP_SCRIPT = r"""
+(() => {
+  const st = window.__rouletteChromeDgaFeed;
+  if (!st) return {ok:true, stopped:false};
+  try { if (st.pingTimer) clearInterval(st.pingTimer); } catch (_) {}
+  try { if (st.ws) st.ws.close(); } catch (_) {}
+  st.status = 'stopped';
+  return {ok:true, stopped:true};
+})()
 """
 
 
@@ -6421,15 +8281,58 @@ class ChromeBridge(threading.Thread):
         self.collector_inflight = set()
         self.collector_lock = threading.Lock()
         self.collector_last_start = 0.0
+        self.api_refresh_mode = False
+        self.api_refresh_remaining = []
+        self.api_refresh_started = 0.0
+        self.api_refresh_total = 0
+        self.api_refresh_success = 0
+        self.api_refresh_fail = 0
+        self.dga_ws_url = DGA_FEED_WS_URL
+        self.dga_casino_id = ""
+        self.dga_currency = ""
+        self.dga_frame_last_keys = {}
+        self.dga_feed = DgaLiveFeedCollector(state)
+        self.chrome_dga_enabled = False
+        self.chrome_dga_session = ""
+        self.chrome_dga_context_id = None
+        self.chrome_dga_contexts = []
+        self.chrome_dga_context_states = {}
+        self.chrome_dga_last_start = 0.0
+        self.chrome_dga_last_poll = 0.0
+        self.chrome_dga_no_data_since = 0.0
+        self.chrome_dga_last_rows_key = ()
+        self.manual_api_teach = False
+        self.manual_api_teach_started = 0.0
         self.live_result_probe = {}
         self.table_scan_enabled = False
         self.table_scan_visited = set()
+        self.table_scan_found_ids = set()
         self.table_scan_no_progress = 0
         self.table_scan_last_scroll_height = 0
         self.table_scan_started = 0.0
         self.table_scan_last_view = 0.0
         self.table_scan_target_id = ""
         self.table_scan_entry_url = ""
+        self.table_scan_auto_cycle = False
+        self.table_scan_next_cycle = 0.0
+        self.table_scan_tab_walk = False
+        self.table_scan_cycle_seconds = TABLE_SCAN_AUTO_REFRESH_SECONDS
+        self.table_scan_probe_done = set()
+        self.table_scan_probe_success = set()
+        self.table_scan_probe_fail = set()
+        self.table_scan_probe_skip = set()
+        self.table_scan_probe_queue = []
+        self.table_scan_probe_targets = {}
+        self.table_scan_probe_urls = set()
+        self.table_scan_probed_keys = set()
+        self.table_scan_clicked_keys = set()
+        self.table_scan_click_deadlines = {}
+        self.table_scan_click_started_at = {}
+        self.table_scan_current_click_key = ""
+        self.table_scan_current_click_label = ""
+        self.table_scan_last_clicked_label = ""
+        self.table_scan_returning_until = 0.0
+        self.table_scan_lobby_seen_at = 0.0
         for _tid, _row in (getattr(state, "table_registry", {}) or {}).items():
             self.collector_seen[str(_tid)] = {
                 "table_id": str(_tid),
@@ -6571,6 +8474,494 @@ class ChromeBridge(threading.Thread):
             )
         return True
 
+    def _dga_table_rows(self):
+        merged = {}
+        with self.collector_lock:
+            for tid, row in (self.collector_seen or {}).items():
+                tid = str(tid or "").strip()
+                if tid:
+                    merged[tid] = dict(row or {})
+        with self.state.lock:
+            for tid, row in (self.state.table_registry or {}).items():
+                tid = str(tid or "").strip()
+                if not tid:
+                    continue
+                old = dict(merged.get(tid, {}) or {})
+                old.update(dict(row or {}))
+                old.setdefault("table_id", tid)
+                merged[tid] = old
+        rows = []
+        for tid, row in merged.items():
+            if str(tid).strip():
+                rows.append({
+                    "table_id": str(tid).strip(),
+                    "display_name": str(row.get("display_name") or tid),
+                })
+        rows.sort(key=lambda row: row["display_name"].lower())
+        return rows
+
+    def start_dga_live_collection(self, reason="kayıtlı masa canlı feed"):
+        rows = self._dga_table_rows()
+        if not rows:
+            with self.state.lock:
+                self.state.table_scan_status = "CHROME DGA: kayıtlı masa bankası yok"
+            return False
+        self.table_scan_auto_cycle = False
+        self.table_scan_next_cycle = 0.0
+        self.chrome_dga_enabled = True
+        self.chrome_dga_session = ""
+        self.chrome_dga_context_id = None
+        self.chrome_dga_last_start = 0.0
+        self.chrome_dga_last_poll = 0.0
+        self.chrome_dga_no_data_since = time.time()
+        self.chrome_dga_last_rows_key = tuple(r["table_id"] for r in rows)
+        # V2.9.25: direct Python DGA caused ConnectionResetError on the user's
+        # operator. Stop that path and open the websocket inside Chrome instead.
+        try:
+            self.dga_feed.stop_collection("Chrome Runtime DGA devrede")
+        except Exception:
+            pass
+        ok = self._start_chrome_dga_runtime(rows=rows, reason=reason)
+        if not ok:
+            # Fallback only when Chrome context is not available at all.
+            self.dga_feed.configure(
+                casino_id=self.dga_casino_id,
+                currency=self.dga_currency,
+                ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
+                enable=True,
+                reason=reason,
+            )
+        return ok
+
+    def _chrome_dga_runtime_contexts(self, limit=10):
+        """Return several Chrome execution contexts to try for DGA WebSocket.
+
+        V2.9.25 used one context; on the user's machine polling returned 0/0
+        because that context did not keep the injected window state. V2.9.26
+        starts/polls multiple Pragmatic/page contexts and uses whichever returns
+        feed data first.
+        """
+        candidates = []
+        sids = []
+        if self.active_game_sid:
+            sids.append(self.active_game_sid)
+        for sid in self.session_info.keys():
+            if sid not in sids:
+                sids.append(sid)
+        for sid in sids:
+            if self._is_collector_session(sid):
+                continue
+            if not self.is_direct_probe_target(sid):
+                continue
+            info = self.session_info.get(sid, {}) or {}
+            url = str(info.get("url", "") or "").lower()
+            title = str(info.get("title", "") or "").lower()
+            text = url + " " + title
+            if any(x in text for x in (
+                "livechat", "gamedata365", "youtube", "facebook", "google",
+            )):
+                continue
+            base = 0
+            if sid == self.active_game_sid:
+                base += 1000
+            if "games." in url or "pragmatic" in text:
+                base += 400
+            if "roulette" in text or "rulet" in text:
+                base += 120
+            if "live-casino" in url or "livecasino" in url:
+                base += 60
+            # Try the session default context too; for top pages this is often
+            # where WebSocket is allowed and where window state survives.
+            candidates.append((base + 10, sid, None))
+            for ctx in (self.execution_contexts.get(sid) or {}).values():
+                cid = ctx.get("id")
+                if cid is None:
+                    continue
+                aux = ctx.get("auxData") or {}
+                origin = str(ctx.get("origin") or "").lower()
+                name = str(ctx.get("name") or "").lower()
+                score = base
+                if bool(aux.get("isDefault", False)):
+                    score += 60
+                if "games." in origin or "pragmatic" in origin:
+                    score += 500
+                if origin.startswith(("http://", "https://")):
+                    score += 20
+                if "isolated" in name:
+                    score -= 80
+                candidates.append((score, sid, int(cid)))
+        candidates.sort(key=lambda row: -row[0])
+        out = []
+        seen = set()
+        for _score, sid, cid in candidates:
+            key = (sid, cid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"session": sid, "context_id": cid})
+            if len(out) >= max(1, int(limit or 10)):
+                break
+        return out
+
+    def _start_chrome_dga_runtime(self, rows=None, reason=""):
+        if self.ws is None:
+            with self.state.lock:
+                self.state.table_scan_status = "CHROME DGA: Chrome bağlantısı bekleniyor"
+            return False
+        rows = rows or self._dga_table_rows()
+        if not rows:
+            with self.state.lock:
+                self.state.table_scan_status = "CHROME DGA: kayıtlı masa bankası yok"
+            return False
+        contexts = self._chrome_dga_runtime_contexts(limit=10)
+        if not contexts:
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    "CHROME DGA: uygun Pragmatic/Chrome context yok • "
+                    "bir rulet masası veya lobi açık olsun"
+                )
+            return False
+        now = time.time()
+        self.chrome_dga_contexts = list(contexts)
+        self.chrome_dga_context_states = {}
+        self.chrome_dga_session = str(contexts[0].get("session") or "")
+        self.chrome_dga_context_id = contexts[0].get("context_id")
+        self.chrome_dga_last_start = now
+        self.chrome_dga_no_data_since = now
+        self.chrome_dga_last_rows_key = tuple(r["table_id"] for r in rows)
+        expr = build_chrome_dga_start_script(
+            rows,
+            casino_id=self.dga_casino_id,
+            currency=self.dga_currency,
+            ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
+        )
+        sent_contexts = 0
+        for ctx in contexts:
+            sid = str(ctx.get("session") or "")
+            context_id = ctx.get("context_id")
+            if not sid:
+                continue
+            params = {
+                "expression": expr,
+                "returnByValue": True,
+                "awaitPromise": True,
+            }
+            if context_id is not None:
+                params["contextId"] = int(context_id)
+            self.send(
+                "Runtime.evaluate",
+                params,
+                session_id=sid,
+                kind="chromedgastart",
+                context={
+                    "session": sid,
+                    "context_id": context_id,
+                    "rows": len(rows),
+                    "reason": reason,
+                },
+            )
+            sent_contexts += 1
+        with self.state.lock:
+            self.state.table_scan_status = (
+                f"CHROME DGA: Chrome içinde websocket açılıyor • {len(rows)} masa • "
+                f"{sent_contexts} context"
+            )
+        return sent_contexts > 0
+
+    def _poll_chrome_dga_runtime(self):
+        if not self.chrome_dga_enabled or self.ws is None:
+            return False
+        now = time.time()
+        rows = self._dga_table_rows()
+        rows_key = tuple(r["table_id"] for r in rows)
+        should_restart = (
+            not self.chrome_dga_contexts
+            or rows_key != tuple(self.chrome_dga_last_rows_key or ())
+            or now - float(self.chrome_dga_last_start or 0.0) >= TABLE_SCAN_AUTO_REFRESH_SECONDS
+        )
+        # If every polled context says 0 tables/no state for a while, the page
+        # probably navigated or the previous injection ran in the wrong frame.
+        if not should_restart and now - float(self.chrome_dga_last_start or 0.0) >= 10.0:
+            states = [
+                st for st in (self.chrome_dga_context_states or {}).values()
+                if now - float(st.get("last", 0.0) or 0.0) <= 8.0
+            ]
+            if states and not any(int(st.get("tables", 0) or 0) > 0 for st in states):
+                should_restart = True
+            if (
+                now - float(self.chrome_dga_no_data_since or now) >= 45.0
+                and states
+                and not any(int(st.get("frames", 0) or 0) > 0 for st in states)
+            ):
+                should_restart = True
+        if should_restart:
+            if now - float(self.chrome_dga_last_start or 0.0) >= 3.0:
+                return self._start_chrome_dga_runtime(rows=rows, reason="context yenile")
+            return False
+        if now - float(self.chrome_dga_last_poll or 0.0) < 2.0:
+            return False
+        self.chrome_dga_last_poll = now
+        sent = 0
+        for ctx in list(self.chrome_dga_contexts or []):
+            sid = str(ctx.get("session") or "")
+            context_id = ctx.get("context_id")
+            if not sid:
+                continue
+            params = {
+                "expression": CHROME_DGA_POLL_SCRIPT,
+                "returnByValue": True,
+                "awaitPromise": True,
+            }
+            if context_id is not None:
+                params["contextId"] = int(context_id)
+            self.send(
+                "Runtime.evaluate",
+                params,
+                session_id=sid,
+                kind="chromedgapoll",
+                context={"session": sid, "context_id": context_id},
+            )
+            sent += 1
+        return sent > 0
+
+    def _handle_chrome_dga_runtime(self, obj, context=None, started=False):
+        try:
+            value = obj.get("result", {}).get("result", {}).get("value")
+            meta = context if isinstance(context, dict) else {}
+            sid_key = str(meta.get("session") or "")
+            ctx_id = meta.get("context_id")
+            ctx_key = f"{sid_key}:{ctx_id if ctx_id is not None else 'default'}"
+            if not isinstance(value, dict):
+                self.chrome_dga_context_states[ctx_key] = {
+                    "ok": False,
+                    "tables": 0,
+                    "sent": 0,
+                    "frames": 0,
+                    "status": "cevap yok",
+                    "last": time.time(),
+                }
+                return
+            now = time.time()
+            casino_id = str(value.get("casinoId") or "").strip()
+            currency = str(value.get("currency") or "").strip().upper()
+            if casino_id or currency:
+                self._record_dga_config(
+                    casino_id=casino_id,
+                    currency=currency,
+                    ws_url=self.dga_ws_url,
+                    source="Chrome Runtime DGA",
+                )
+
+            messages = value.get("messages") or []
+            handled = 0
+            for raw in messages if isinstance(messages, list) else []:
+                if self._handle_dga_ws_payload(raw, source_label="Chrome Runtime DGA"):
+                    handled += 1
+            ok_value = bool(value.get("ok", True))
+            status = str(value.get("status") or "")
+            frames = int(value.get("frames", 0) or 0)
+            sent = int(value.get("sent", 0) or 0)
+            tables = int(value.get("tables", 0) or 0)
+            err = str(value.get("lastError") or value.get("reason") or value.get("closeReason") or "")
+            close_code = int(value.get("closeCode", 0) or 0)
+
+            self.chrome_dga_context_states[ctx_key] = {
+                "ok": ok_value,
+                "tables": tables,
+                "sent": sent,
+                "frames": frames,
+                "status": status,
+                "error": err,
+                "last": now,
+            }
+
+            if messages or frames > 0 or handled:
+                self.chrome_dga_no_data_since = now
+            elif frames <= 0 and not self.chrome_dga_no_data_since:
+                self.chrome_dga_no_data_since = now
+
+            if handled:
+                # _handle_dga_ws_payload already wrote a data-specific status.
+                return
+
+            recent_states = [
+                st for st in (self.chrome_dga_context_states or {}).values()
+                if now - float(st.get("last", 0.0) or 0.0) <= 8.0
+            ]
+            valid = [st for st in recent_states if int(st.get("tables", 0) or 0) > 0]
+            total_frames = sum(int(st.get("frames", 0) or 0) for st in valid)
+            max_tables = max([int(st.get("tables", 0) or 0) for st in valid] or [0])
+            max_sent = max([int(st.get("sent", 0) or 0) for st in valid] or [0])
+            context_count = len(self.chrome_dga_contexts or [])
+
+            # Do not leave the user stuck at 0/0. That means the injected state
+            # was not found in the polled context; force a reinjection cycle.
+            if (
+                not valid
+                and not started
+                and now - float(self.chrome_dga_last_start or 0.0) >= 10.0
+            ):
+                self.chrome_dga_contexts = []
+                self.chrome_dga_session = ""
+                self.chrome_dga_last_start = 0.0
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"CHROME DGA: context state boş • {context_count} context • "
+                        "yeniden başlatılıyor"
+                    )
+                return
+
+            if (
+                valid
+                and total_frames <= 0
+                and now - float(self.chrome_dga_no_data_since or now) >= 45.0
+            ):
+                self.chrome_dga_contexts = []
+                self.chrome_dga_session = ""
+                self.chrome_dga_last_start = 0.0
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        "CHROME DGA: 45 sn frame yok • context yenileniyor"
+                    )
+                return
+
+            if status in ("closed", "error", "failed") and now - float(self.chrome_dga_last_start or 0.0) >= 5.0:
+                if not any(str(st.get("status") or "") == "open" for st in valid):
+                    self.chrome_dga_contexts = []
+                    self.chrome_dga_session = ""
+                    self.chrome_dga_last_start = 0.0
+                    with self.state.lock:
+                        self.state.table_scan_status = (
+                            f"CHROME DGA: {status}"
+                            + (f" {close_code}" if close_code else "")
+                            + (f" • {err[:60]}" if err else "")
+                            + " • yeniden deneniyor"
+                        )
+                    return
+
+            if started:
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"CHROME DGA: başlatıldı • {tables or meta.get('rows', 0)} masa • "
+                        f"{context_count} context • casino {casino_id or self.dga_casino_id or '?'} • "
+                        f"{currency or self.dga_currency or '?'}"
+                    )
+            else:
+                wait_sec = int(now - float(self.chrome_dga_no_data_since or now))
+                extra = ""
+                if not ok_value:
+                    extra = (f" • {err[:70]}" if err else " • state yok")
+                elif total_frames > 0:
+                    extra = " • frame var, tablo verisi bekleniyor"
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"CHROME DGA: {status or 'bekleniyor'} • "
+                        f"{max_sent}/{max_tables} abonelik • {total_frames} frame • "
+                        f"{context_count} context • {wait_sec}s veri bekliyor{extra}"
+                    )
+        except Exception:
+            pass
+
+    def _record_dga_config(self, casino_id="", currency="", ws_url="", source=""):
+        changed = False
+        casino_id = str(casino_id or "").strip()
+        currency = str(currency or "").strip().upper()
+        ws_url = str(ws_url or "").strip()
+        if ws_url and "dga." in ws_url.lower() and ws_url != self.dga_ws_url:
+            self.dga_ws_url = ws_url
+            changed = True
+        if casino_id and casino_id != self.dga_casino_id:
+            self.dga_casino_id = casino_id
+            changed = True
+        if currency and currency != self.dga_currency:
+            self.dga_currency = currency
+            changed = True
+        if changed:
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    "DGA CANLI: Chrome feed bilgisi yakalandı • "
+                    f"casino {self.dga_casino_id or '?'} • {self.dga_currency or '?'}"
+                )
+            # If the user already started DGA collection with the fallback id,
+            # update the running worker to the real operator parameters.
+            if self.chrome_dga_enabled:
+                self.chrome_dga_session = ""
+                self.chrome_dga_contexts = []
+                self.chrome_dga_context_states = {}
+                self.chrome_dga_last_start = 0.0
+            if getattr(self.dga_feed, "enabled", False):
+                self.dga_feed.configure(
+                    casino_id=self.dga_casino_id,
+                    currency=self.dga_currency,
+                    ws_url=self.dga_ws_url or DGA_FEED_WS_URL,
+                    enable=True,
+                    reason=source or "Chrome DGA config",
+                )
+        return changed
+
+    def _handle_dga_ws_payload(self, payload_text, sid="", direction="", source_label="Chrome DGA WebSocket"):
+        raw = str(payload_text or "")
+        if not raw:
+            return False
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return False
+        handled = False
+        if isinstance(payload, dict):
+            typ = str(payload.get("type") or "").lower()
+            casino_id = str(payload.get("casinoId") or payload.get("casinoID") or "").strip()
+            currency = str(payload.get("currency") or payload.get("currencyId") or "").strip()
+            if typ == "subscribe" or casino_id:
+                self._record_dga_config(
+                    casino_id=casino_id,
+                    currency=currency,
+                    ws_url=self.dga_ws_url,
+                    source="Chrome websocket subscribe",
+                )
+                keys = payload.get("key") or payload.get("keys") or []
+                if isinstance(keys, str):
+                    keys = [keys]
+                discovered = []
+                for key in keys if isinstance(keys, list) else []:
+                    tid = str(key or "").strip()
+                    if tid:
+                        discovered.append({"table_id": tid, "display_name": tid})
+                if discovered and not self.manual_api_teach:
+                    self._register_discovered_tables(discovered, source="DGA websocket subscribe")
+                handled = True
+        rows = extract_dga_feed_tables(payload)
+        if rows:
+            handled = True
+            for row in rows:
+                tid = str(row.get("table_id") or "").strip()
+                nums = [int(x) for x in (row.get("nums") or []) if isinstance(x, int)]
+                name = str(row.get("display_name") or tid)
+                if not tid:
+                    continue
+                if len(nums) >= 20:
+                    key = tuple(nums[:20])
+                    if self.dga_frame_last_keys.get(tid) == key:
+                        continue
+                    self.dga_frame_last_keys[tid] = key
+                    self.state.store_background_table_history(
+                        nums,
+                        table_id=tid,
+                        display_name=name,
+                        source_label=source_label,
+                    )
+                    self.state.mark_table_attempt(tid, ok=True)
+                    with self.state.lock:
+                        self.state.table_scan_status = (
+                            f"DGA CANLI: Chrome feed veri aldı • {name[:48]}"
+                        )
+                else:
+                    self._register_discovered_tables(
+                        [{"table_id": tid, "display_name": name}],
+                        source="Chrome DGA WebSocket",
+                    )
+        return handled
+
     def _collector_launch_url(self):
         return PRAGMATIC_LOBBY_SCAN_URL
 
@@ -6580,14 +8971,35 @@ class ChromeBridge(threading.Thread):
                 return tid
         return ""
 
+    def _collector_root_session(self):
+        root = str(self.table_scan_target_id or "")
+        if not root:
+            return ""
+        return str(self.target_sessions.get(root, "") or "")
+
     def _is_collector_target_id(self, target_id):
         root = str(self.table_scan_target_id or "")
         tid = str(target_id or "")
-        if not root or not tid:
+        if not tid:
+            return False
+
+        def is_probe_target(tid_value):
+            probe_targets = getattr(self, "table_scan_probe_targets", {}) or {}
+            probe_urls = getattr(self, "table_scan_probe_urls", set()) or set()
+            if tid_value in probe_targets:
+                return True
+            info = self.target_info.get(tid_value, {}) or {}
+            url = str(info.get("url", "") or "")
+            return bool(url and url in probe_urls)
+
+        if is_probe_target(tid):
+            return True
+
+        if not root:
             return False
         seen = set()
         for _ in range(8):
-            if tid == root:
+            if tid == root or is_probe_target(tid):
                 return True
             if not tid or tid in seen:
                 return False
@@ -6604,41 +9016,443 @@ class ChromeBridge(threading.Thread):
         return self._is_collector_target_id(self._target_id_for_session(sid))
 
     def _close_table_scan_target(self):
-        tid = str(self.table_scan_target_id or "")
+        tids = []
+        root = str(self.table_scan_target_id or "")
+        if root:
+            tids.append(root)
+        tids.extend(list(self.table_scan_probe_targets.keys()))
         self.table_scan_target_id = ""
-        if tid and self.ws is not None:
-            try:
-                self.send("Target.closeTarget", {"targetId": tid})
-            except Exception:
-                pass
+        self.table_scan_probe_targets = {}
+        self.table_scan_probe_urls = set()
+        self.table_scan_probe_queue = []
+        self.table_scan_probe_done = set()
+        self.table_scan_probe_success = set()
+        self.table_scan_probe_fail = set()
+        self.table_scan_probe_skip = set()
+        self.table_scan_click_deadlines = {}
+        self.table_scan_click_started_at = {}
+        self.table_scan_returning_until = 0.0
+        self.table_scan_lobby_seen_at = 0.0
+        if self.ws is not None:
+            for tid in tids:
+                try:
+                    self.send("Target.closeTarget", {"targetId": tid})
+                except Exception:
+                    pass
 
-    def start_table_scan(self):
-        self._close_table_scan_target()
-        self.table_scan_enabled = True
+    def _start_lobby_collector_target(self, status_text):
         self.table_scan_visited = set()
+        self.table_scan_found_ids = set()
         self.table_scan_no_progress = 0
         self.table_scan_last_scroll_height = 0
         self.table_scan_started = time.time()
         self.table_scan_last_view = 0.0
         self.table_scan_entry_url = self._collector_launch_url()
+        self.table_scan_probe_queue = []
+        self.table_scan_probe_targets = {}
+        self.table_scan_probe_urls = set()
+        self.table_scan_probed_keys = set()
+        self.table_scan_clicked_keys = set()
+        self.table_scan_click_deadlines = {}
+        self.table_scan_click_started_at = {}
+        self.table_scan_probe_done = set()
+        self.table_scan_probe_success = set()
+        self.table_scan_probe_fail = set()
+        self.table_scan_probe_skip = set()
+        self.table_scan_current_click_key = ""
+        self.table_scan_current_click_label = ""
+        self.table_scan_last_clicked_label = ""
+        self.table_scan_returning_until = 0.0
+        self.table_scan_lobby_seen_at = 0.0
         self.send(
             "Target.createTarget",
-            {"url": self.table_scan_entry_url, "background": True},
+            {
+                "url": self.table_scan_entry_url,
+                "background": not bool(self.table_scan_tab_walk),
+            },
             kind="collectorcreate",
             context={"url": self.table_scan_entry_url},
         )
         with self.state.lock:
-            self.state.table_scan_status = (
-                "MASA TARAMA: Pragmatic Play lobisi arka planda açılıyor"
-            )
+            self.state.table_scan_status = status_text
         return True
 
-    def stop_table_scan(self, reason="kullanıcı durdurdu"):
-        self.table_scan_enabled = False
-        self._close_table_scan_target()
+    def start_table_scan(self, auto_cycle=True):
+        self.table_scan_tab_walk = False
+        self.table_scan_cycle_seconds = TABLE_SCAN_AUTO_REFRESH_SECONDS
         with self.state.lock:
-            self.state.table_scan_status = f"MASA TARAMA: durdu • {reason}"
+            bank_count = len(getattr(self.state, "table_registry", {}) or {})
+        if bank_count:
+            # DGA remains available for already-learned banks, but the separate
+            # V2.9.27 tab-walk button below forces visible table-by-table visits.
+            return self.start_dga_live_collection("PRAGMATIC MASALARI TARA")
+
+        self._close_table_scan_target()
+        self.table_scan_tab_walk = False
+        self.table_scan_cycle_seconds = TABLE_SCAN_AUTO_REFRESH_SECONDS
+        self.table_scan_auto_cycle = bool(auto_cycle)
+        self.table_scan_next_cycle = 0.0
+        self.table_scan_enabled = True
+        return self._start_lobby_collector_target(
+            "MASA TARAMA: Pragmatic Play lobisi arka planda açılıyor"
+        )
+
+    def start_tab_walk_scan(self, auto_cycle=True):
+        """Open roulette lobby and collect tables in one side tab.
+
+        The user keeps playing in their own tab. This collector tab enters the
+        Pragmatic lobby, clicks one real table card, waits on the lower-right
+        SON 500 panel above Automatic Play, saves it, returns to lobby, then
+        clicks the next table. A completed pass repeats every 5 minutes.
+        """
+        self._close_table_scan_target()
+        self.chrome_dga_enabled = False
+        try:
+            self.dga_feed.stop_collection("sekmeli lobi toplayıcı")
+        except Exception:
+            pass
+        self.manual_api_teach = False
+        self.table_scan_tab_walk = True
+        self.table_scan_cycle_seconds = TAB_WALK_REFRESH_SECONDS
+        self.table_scan_auto_cycle = bool(auto_cycle)
+        self.table_scan_next_cycle = 0.0
+        self.table_scan_enabled = True
+        return self._start_lobby_collector_target(
+            "TEK SEKME TOPLA: Pragmatic Play lobisi açılıyor • aynı yan sekmede masalar tek tek gezilecek"
+        )
+
+    def stop_table_scan(self, reason="kullanıcı durdurdu"):
+        manual_stop = "kullanıcı" in str(reason).lower()
+        self.table_scan_enabled = False
+        self.manual_api_teach = False
+        self._close_table_scan_target()
+        if manual_stop:
+            self.table_scan_auto_cycle = False
+            self.table_scan_next_cycle = 0.0
+            self.chrome_dga_enabled = False
+            if self.ws is not None and self.chrome_dga_session:
+                try:
+                    self.send(
+                        "Runtime.evaluate",
+                        {"expression": CHROME_DGA_STOP_SCRIPT, "returnByValue": True},
+                        session_id=self.chrome_dga_session,
+                        kind="chromedgastop",
+                        context={},
+                    )
+                except Exception:
+                    pass
+            try:
+                self.dga_feed.stop_collection("kullanıcı durdurdu")
+            except Exception:
+                pass
+        elif self.table_scan_auto_cycle:
+            delay = float(
+                self.table_scan_cycle_seconds
+                if self.table_scan_tab_walk
+                else TABLE_SCAN_AUTO_REFRESH_SECONDS
+            )
+            self.table_scan_next_cycle = time.time() + delay
+        with self.state.lock:
+            if self.table_scan_auto_cycle and not manual_stop:
+                mins = int(round(float(
+                    self.table_scan_cycle_seconds
+                    if self.table_scan_tab_walk
+                    else TABLE_SCAN_AUTO_REFRESH_SECONDS
+                ) / 60.0))
+                prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+                self.state.table_scan_status = (
+                    f"{prefix}: {reason} • {mins} dk sonra otomatik tekrar"
+                )
+            else:
+                self.state.table_scan_status = f"MASA TARAMA/API ÖĞREN: durdu • {reason}"
         return True
+
+    def _is_blocked_table_label(self, text):
+        up = str(text or "").upper()
+        if not up:
+            return False
+        return any(str(x or "").upper() in up for x in TAB_WALK_BLOCKED_TABLE_LABELS)
+
+    def _clean_collector_label(self, text, fallback="Roulette"):
+        label = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not label:
+            return fallback
+        low = label.lower()
+        if low.startswith(("http://", "https://")) or "client." in low or "/client" in low:
+            return fallback
+        nums = re.findall(r"\b(?:[0-9]|[12][0-9]|3[0-6])\b", label)
+        upper = label.upper()
+        if len(nums) >= 8:
+            m = re.search(
+                r"([A-ZÇĞİÖŞÜ0-9 ._-]{0,28}(?:ROULETTE|RULET)[A-ZÇĞİÖŞÜ0-9 ._-]{0,28})",
+                upper,
+                flags=re.I,
+            )
+            if m:
+                label = m.group(1).strip(" -_•|")
+            else:
+                label = fallback
+        return label[:80] or fallback
+
+    def _collector_table_identity(self, sid="", real_table_id="", title=""):
+        real = str(real_table_id or "").strip()
+        raw_label = str(
+            title
+            or self.table_scan_current_click_label
+            or self.table_scan_last_clicked_label
+            or real
+            or "Roulette"
+        ).strip()
+        label = self._clean_collector_label(raw_label, fallback=real or "Roulette")
+        if real:
+            return real, (label or real)
+        raw = str(self.table_scan_current_click_key or raw_label or sid or "collector")
+        digest = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:12]
+        return f"collector_{digest}", (label or f"Roulette {digest}")
+
+    def _schedule_collector_return(self, sid, delay=0.8):
+        now = time.time()
+        delay = float(delay or 0.8)
+        sid = str(sid or "")
+        if self.table_scan_tab_walk:
+            started = 0.0
+            if sid:
+                started = float(self.table_scan_click_started_at.get(sid, 0.0) or 0.0)
+            if not started:
+                for v in self.table_scan_click_started_at.values():
+                    try:
+                        started = max(started, float(v or 0.0))
+                    except Exception:
+                        pass
+            if started:
+                delay = max(
+                    delay,
+                    max(0.8, TAB_WALK_TABLE_MIN_DWELL_SECONDS - (now - started)),
+                )
+        due = now + delay
+        if sid:
+            self.table_scan_click_deadlines[sid] = due
+        if self.table_scan_tab_walk:
+            root_sid = self._collector_root_session()
+            for scan_sid in list(self.session_info.keys()):
+                if not self._is_collector_session(scan_sid):
+                    continue
+                if scan_sid == sid or scan_sid == root_sid or scan_sid in self.table_scan_click_deadlines:
+                    old = float(self.table_scan_click_deadlines.get(scan_sid, 0.0) or 0.0)
+                    self.table_scan_click_deadlines[scan_sid] = min(old, due) if old else due
+                    self.table_scan_click_started_at.setdefault(scan_sid, (started or now) if self.table_scan_tab_walk else now)
+        return due
+
+    def _return_collector_to_lobby(self, sid, reason="sıradaki masa"):
+        if not sid or self.ws is None:
+            return False
+        url = str(self.table_scan_entry_url or self._collector_launch_url() or "")
+        now = time.time()
+        if self.table_scan_tab_walk:
+            # V2.9.42: once we have intentionally pressed in-game Lobi, the old
+            # game iframe can keep reporting SON500/Lobi controls for a few
+            # seconds even though the visible root page is already the lobby.
+            # During this grace window the lobby scanner is allowed to win and
+            # stale game detections must not recreate a table wait.
+            self.table_scan_returning_until = max(
+                float(getattr(self, "table_scan_returning_until", 0.0) or 0.0),
+                now + TAB_WALK_RETURN_GRACE_SECONDS,
+            )
+        self.table_scan_click_deadlines.pop(sid, None)
+        self.table_scan_click_started_at.pop(sid, None)
+        tid = self._target_id_for_session(sid)
+        root = str(self.table_scan_target_id or "")
+        try:
+            if self.table_scan_tab_walk:
+                # V2.9.34: after reading the game's lower-right SON500 panel,
+                # return by clicking the in-game top-right Lobi/Lobby button.
+                # Do not history.back() to the operator search page; that caused
+                # the collector to get stuck typing "pragmatic play lobby" again.
+                for scan_sid in list(self.table_scan_click_deadlines.keys()):
+                    if self._is_collector_session(scan_sid):
+                        self.table_scan_click_deadlines.pop(scan_sid, None)
+                        self.table_scan_click_started_at.pop(scan_sid, None)
+                        self.session_table_activity.pop(scan_sid, None)
+                for scan_sid in list(self.session_info.keys()):
+                    if self._is_collector_session(scan_sid):
+                        self.session_table_activity.pop(scan_sid, None)
+                root_sid = self._collector_root_session() or sid
+                return_sids = []
+                for candidate in (sid, root_sid):
+                    if candidate and candidate not in return_sids:
+                        return_sids.append(candidate)
+                # The button may live in the root page or a Pragmatic OOPIF.
+                # Send the same safe click probe to every collector session.
+                for scan_sid in list(self.session_info.keys()):
+                    if scan_sid not in return_sids and self._is_collector_session(scan_sid):
+                        return_sids.append(scan_sid)
+                for return_sid in return_sids[:10]:
+                    self.send(
+                        "Runtime.evaluate",
+                        {
+                            "expression": COLLECTOR_LOBBY_CLICK_SCRIPT,
+                            "returnByValue": True,
+                            "awaitPromise": True,
+                        },
+                        session_id=return_sid,
+                        kind="collectorback",
+                        context={"session": return_sid, "from": sid, "reason": reason},
+                    )
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"SEKMELİ TOPLA: {reason} • oyun içi Lobi düğmesine basılıyor"
+                    )
+            elif tid and root and tid != root:
+                self.send("Target.closeTarget", {"targetId": tid})
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"MASA TARAMA: {reason} • sekme kapatılıyor"
+                    )
+            else:
+                if not url:
+                    return False
+                self.send("Page.navigate", {"url": url}, session_id=sid)
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"MASA TARAMA: {reason} • lobiye dönülüyor"
+                    )
+            return True
+        except Exception:
+            return False
+
+    def _cleanup_table_scan_probes(self):
+        if not self.table_scan_probe_targets:
+            return
+        now = time.time()
+        close_ids = []
+        for tid, row in list(self.table_scan_probe_targets.items()):
+            opened = float(row.get("opened", 0.0) or 0.0)
+            seen_at = float(row.get("table_seen_at", 0.0) or 0.0)
+            done_at = float(row.get("done_at", 0.0) or 0.0)
+            if done_at and now - done_at >= 0.8:
+                close_ids.append(tid)
+            elif self.table_scan_tab_walk and opened and now - opened >= TAB_WALK_TABLE_TIMEOUT_SECONDS:
+                self.table_scan_probe_done.add(str(row.get("key") or tid))
+                self.table_scan_probe_fail.add(str(row.get("key") or tid))
+                row["done_at"] = now
+                close_ids.append(tid)
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        "SEKMELİ TOPLA: masa veri zaman aşımı • "
+                        f"{str(row.get('label') or row.get('table_id') or tid)[:48]} • sıradaki masaya geçiliyor"
+                    )
+            elif (not self.table_scan_tab_walk) and seen_at and now - seen_at >= 3.0:
+                close_ids.append(tid)
+            elif (not self.table_scan_tab_walk) and opened and now - opened >= COLLECTOR_PROBE_SECONDS:
+                close_ids.append(tid)
+        for tid in close_ids:
+            row = self.table_scan_probe_targets.pop(tid, None) or {}
+            url = str(row.get("url") or "")
+            if url:
+                self.table_scan_probe_urls.discard(url)
+            if self.ws is not None:
+                try:
+                    self.send("Target.closeTarget", {"targetId": tid})
+                except Exception:
+                    pass
+
+    def _operator_table_probe_url(self, game_id, label=""):
+        gid = str(game_id or "").strip()
+        if not gid:
+            return ""
+        base = str(self.table_scan_entry_url or PRAGMATIC_LOBBY_SCAN_URL)
+        try:
+            u = urllib.parse.urlsplit(base)
+            qs = urllib.parse.parse_qsl(u.query, keep_blank_values=False)
+            drop = {"opengames", "gamenames", "gameid", "tableid", "table_id"}
+            cleaned = [(k, v) for k, v in qs if str(k).lower() not in drop]
+            cleaned.append(("openGames", gid))
+            cleaned.append(("gameNames", str(label or "Roulette")[:120]))
+            return urllib.parse.urlunsplit((
+                u.scheme,
+                u.netloc,
+                u.path or "/",
+                urllib.parse.urlencode(cleaned, doseq=True),
+                "",
+            ))
+        except Exception:
+            return ""
+
+    def _queue_table_probe(self, row):
+        if not isinstance(row, dict):
+            return False
+        if COLLECTOR_PROBE_INITIAL_CONCURRENT <= 0 and not self.table_scan_tab_walk:
+            return False
+        href = str(row.get("href") or "").strip()
+        label = str(row.get("label") or "").strip()
+        game_id = str(row.get("game_id") or "").strip()
+        table_id = str(row.get("table_id") or "").strip()
+        key = str(row.get("key") or table_id or game_id or href or label).strip()
+
+        url = href if href.startswith(("http://", "https://")) else ""
+        # Direct games.* / provider-lobby URLs can stay on a black splash
+        # screen. Prefer the operator wrapper URL when game_id is available.
+        try:
+            host = urllib.parse.urlsplit(url).hostname or ""
+            if game_id and host.lower().startswith("games."):
+                url = ""
+        except Exception:
+            pass
+        if not url and game_id:
+            url = self._operator_table_probe_url(game_id, label)
+
+        if not url or not url.startswith(("http://", "https://")):
+            return False
+        if not key:
+            return False
+        if key in self.table_scan_probed_keys:
+            return False
+        if url in self.table_scan_probe_urls:
+            return False
+        if any(str(q.get("key") or "") == key for q in self.table_scan_probe_queue):
+            return False
+        self.table_scan_probe_queue.append({
+            "key": key,
+            "url": url,
+            "label": label[:160],
+            "table_id": table_id,
+            "game_id": game_id,
+            "queued": time.time(),
+        })
+        return True
+
+    def _pump_table_scan_probes(self):
+        if not self.table_scan_enabled or self.ws is None:
+            return
+        self._cleanup_table_scan_probes()
+        active = len(self.table_scan_probe_targets)
+        if self.table_scan_tab_walk:
+            limit = 1
+        else:
+            limit = (
+                COLLECTOR_PROBE_STEADY_CONCURRENT
+                if self.table_scan_found_ids
+                else COLLECTOR_PROBE_INITIAL_CONCURRENT
+            )
+        limit = max(0, int(limit or 0))
+        if limit <= 0:
+            self.table_scan_probe_queue = []
+            return
+        while active < limit and self.table_scan_probe_queue:
+            row = self.table_scan_probe_queue.pop(0)
+            key = str(row.get("key") or "")
+            url = str(row.get("url") or "")
+            if not url or not key or key in self.table_scan_probed_keys:
+                continue
+            self.table_scan_probed_keys.add(key)
+            self.table_scan_probe_urls.add(url)
+            self.send(
+                "Target.createTarget",
+                {"url": url, "background": not bool(self.table_scan_tab_walk)},
+                kind="collectorprobecreate",
+                context=row,
+            )
+            active += 1
 
     def browser_ws_url(self):
         with urllib.request.urlopen(
@@ -7033,6 +9847,97 @@ class ChromeBridge(threading.Thread):
         if mode in ("provider_lobby", "navigating"):
             self.table_scan_last_view = now
 
+        prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+        returning_to_lobby = bool(
+            self.table_scan_tab_walk
+            and float(getattr(self, "table_scan_returning_until", 0.0) or 0.0) > now
+        )
+        recent_lobby_visible = bool(
+            self.table_scan_tab_walk
+            and not self.table_scan_current_click_key
+            and float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0)
+            and now - float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0) <= 30.0
+        )
+        if (returning_to_lobby or recent_lobby_visible) and mode in ("game_has_son500", "game_no_son500", "game_blocked"):
+            # V2.9.42: ignore stale child game frames just after we pressed the
+            # in-game Lobi button or after the root page has already shown real
+            # lobby cards. The visible lobby scan will continue/finish the pass.
+            return
+
+        if mode in ("game_no_son500", "game_blocked"):
+            key = str(self.table_scan_current_click_key or self.table_scan_last_clicked_label or sid)
+            if key:
+                self.table_scan_probe_done.add(key)
+                self.table_scan_probe_skip.add(key)
+            label = self._clean_collector_label(
+                self.table_scan_current_click_label
+                or self.table_scan_last_clicked_label
+                or str(value.get("title") or "Roulette"),
+                fallback="Roulette",
+            )
+            reason = "bloklu masa" if mode == "game_blocked" else "SON500 paneli yok"
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    f"{prefix}: {reason} • {label[:44]} • anında es geçiliyor"
+                )
+            self._return_collector_to_lobby(sid, f"{reason} • es geçildi")
+            self.table_scan_current_click_key = ""
+            self.table_scan_current_click_label = ""
+            return
+
+        if mode == "game_has_son500":
+            # V2.9.39: The game screen is open and SON500 is visible. Do not
+            # let the generic lobby/card scanner interpret betting grid numbers
+            # as roulette cards. Recreate the table wait if it was lost; the
+            # next scan loop will run HISTORY500_SCAN and save 500/500.
+            if not self.table_scan_click_deadlines:
+                self.table_scan_click_deadlines[sid] = now + TAB_WALK_TABLE_TIMEOUT_SECONDS
+                self.table_scan_click_started_at.setdefault(sid, now)
+            label = self._clean_collector_label(
+                self.table_scan_current_click_label
+                or self.table_scan_last_clicked_label
+                or str(value.get("title") or "Roulette"),
+                fallback="Roulette",
+            )
+            try:
+                collector_tid = str(
+                    (self.session_table_activity.get(sid, {}) or {}).get("table_id", "")
+                    or ""
+                )
+                fallback_tid, fallback_title = self._collector_table_identity(
+                    sid,
+                    real_table_id=collector_tid,
+                    title=label,
+                )
+                params = {
+                    "expression": HISTORY500_SCAN,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                }
+                context_id = meta.get("context_id")
+                if context_id is not None:
+                    params["contextId"] = int(context_id)
+                self.send(
+                    "Runtime.evaluate",
+                    params,
+                    session_id=sid,
+                    kind="background500",
+                    context={
+                        "session": sid,
+                        "table_id": fallback_tid,
+                        "real_table_id": collector_tid,
+                        "title": fallback_title,
+                        "collector": True,
+                    },
+                )
+            except Exception:
+                pass
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    f"{prefix}: masa açık • SON500 paneli görüldü • {label[:44]} • 500 spin okunuyor"
+                )
+            return
+
         if mode == "waiting":
             if now - float(self.table_scan_last_view or 0.0) < 8.0:
                 return
@@ -7043,11 +9948,15 @@ class ChromeBridge(threading.Thread):
             else:
                 message = "lobi görünümü bekleniyor"
             with self.state.lock:
-                self.state.table_scan_status = f"MASA TARAMA: {message}"
+                self.state.table_scan_status = f"{prefix}: {message}"
             return
 
         if mode == "navigating":
-            if stage == "menu-opened":
+            if stage == "pragmatic-lobby-card-play":
+                message = "site aramasındaki Pragmatic Play Lobby kartında Oyna tıklandı"
+            elif stage == "pragmatic-lobby-search-typed":
+                message = "arama kutusuna pragmatic play lobby yazıldı"
+            elif stage == "menu-opened":
                 message = "sol kategori menüsü açıldı • Rulet seçiliyor"
             elif stage == "roulette-selecting":
                 message = "Rulet kategorisi seçiliyor"
@@ -7056,14 +9965,70 @@ class ChromeBridge(threading.Thread):
             else:
                 message = "Pragmatic lobi içinde geziniliyor"
             with self.state.lock:
-                self.state.table_scan_status = f"MASA TARAMA: {message}"
+                self.state.table_scan_status = f"{prefix}: {message}"
+            return
+
+        if mode == "card_clicked":
+            self.table_scan_returning_until = 0.0
+            self.table_scan_lobby_seen_at = 0.0
+            clicked_key = str(value.get("clickedKey") or "").strip()
+            clicked_label = str(value.get("clickedLabel") or "").strip()
+            if clicked_key:
+                self.table_scan_clicked_keys.add(clicked_key)
+                self.table_scan_current_click_key = clicked_key
+            if clicked_label:
+                self.table_scan_current_click_label = clicked_label
+                self.table_scan_last_clicked_label = clicked_label
+            for row in [r for r in (value.get("cards") or []) if isinstance(r, dict)]:
+                key = str(row.get("key") or "").strip()
+                if key:
+                    self.table_scan_visited.add(key)
+                table_id = str(row.get("table_id") or "").strip()
+                if table_id:
+                    self.table_scan_found_ids.add(table_id)
+                    self._register_discovered_tables([{
+                        "table_id": table_id,
+                        "display_name": str(row.get("label") or table_id),
+                    }], source="PRAGMATIC LOBI KARTI")
+            wait_seconds = (
+                TAB_WALK_TABLE_TIMEOUT_SECONDS
+                if self.table_scan_tab_walk
+                else COLLECTOR_CARD_CLICK_SECONDS
+            )
+            self.table_scan_click_deadlines[sid] = now + wait_seconds
+            self.table_scan_click_started_at = {sid: now}
+            # Clear stale table activity from the previous table; otherwise a
+            # cached statisticHistory/resource entry can be mistaken for the
+            # newly clicked table and make the collector return immediately.
+            for scan_sid in list(self.session_info.keys()):
+                if self._is_collector_session(scan_sid):
+                    self.session_table_activity.pop(scan_sid, None)
+            clean_clicked_label = self._clean_collector_label(clicked_label, fallback="veri bekleniyor")
+            with self.state.lock:
+                self.state.table_scan_status = (
+                    f"{prefix}: masa kartı tıklandı • "
+                    + (clean_clicked_label[:60] if clean_clicked_label else "veri bekleniyor")
+                    + " • sağ-alt SON500 paneli bekleniyor"
+                )
             return
 
         if mode != "provider_lobby":
             return
 
         cards = [row for row in (value.get("cards") or []) if isinstance(row, dict)]
+        if self.table_scan_tab_walk and cards:
+            self.table_scan_lobby_seen_at = now
+            if returning_to_lobby or self.table_scan_click_deadlines:
+                self.table_scan_returning_until = 0.0
+                for scan_sid in list(self.session_info.keys()):
+                    if self._is_collector_session(scan_sid):
+                        self.table_scan_click_deadlines.pop(scan_sid, None)
+                        self.table_scan_click_started_at.pop(scan_sid, None)
+                        self.session_table_activity.pop(scan_sid, None)
+                self.table_scan_current_click_key = ""
+                self.table_scan_current_click_label = ""
         before = len(self.table_scan_visited)
+        queued_probes = 0
         for row in cards:
             key = str(row.get("key") or "").strip()
             if not key:
@@ -7072,10 +10037,16 @@ class ChromeBridge(threading.Thread):
                 self.table_scan_visited.add(key)
             table_id = str(row.get("table_id") or "").strip()
             if table_id:
+                self.table_scan_found_ids.add(table_id)
                 self._register_discovered_tables([{
                     "table_id": table_id,
                     "display_name": str(row.get("label") or table_id),
                 }], source="PRAGMATIC LOBI KARTI")
+            if (not self.table_scan_tab_walk) and (not table_id) and self._queue_table_probe(row):
+                queued_probes += 1
+
+        if queued_probes:
+            self._pump_table_scan_probes()
 
         new_cards = len(self.table_scan_visited) - before
         try:
@@ -7085,28 +10056,66 @@ class ChromeBridge(threading.Thread):
         except (TypeError, ValueError):
             scroll_height = scroll_top = client_height = 0
         at_bottom = bool(value.get("atBottom", True))
+        bottom_seen_once = bool(value.get("atBottomSeen", False))
 
         if scroll_height != self.table_scan_last_scroll_height:
             self.table_scan_last_scroll_height = scroll_height
             self.table_scan_no_progress = 0
-        elif at_bottom and new_cards == 0 and self.table_scan_visited:
+        elif (at_bottom or bottom_seen_once) and new_cards == 0 and self.table_scan_visited:
             self.table_scan_no_progress += 1
         else:
             self.table_scan_no_progress = 0
 
+        self._pump_table_scan_probes()
+        probe_active = len(self.table_scan_probe_targets)
+        probe_waiting = len(self.table_scan_probe_queue)
+        scan_id_count = len(self.table_scan_found_ids)
+        remaining_clicks = max(0, len(self.table_scan_visited) - len(self.table_scan_clicked_keys))
         with self.state.lock:
-            table_count = len(self.state.table_registry)
-        if at_bottom and self.table_scan_no_progress >= 5:
+            bank_count = len(self.state.table_registry)
+        if (
+            (at_bottom or bottom_seen_once)
+            and self.table_scan_no_progress >= 3
+            and probe_active == 0
+            and probe_waiting == 0
+            and remaining_clicks <= 0
+            and not self.table_scan_click_deadlines
+        ):
             self.stop_table_scan(
                 f"lobi sonuna ulaşıldı • {len(self.table_scan_visited)} kart, "
-                f"{table_count} masa ID"
+                f"bu taramada {scan_id_count} gerçek masa ID • kayıtlı banka {bank_count}"
             )
             return
 
+        active_limit = (
+            1 if self.table_scan_tab_walk else (
+                COLLECTOR_PROBE_STEADY_CONCURRENT
+                if self.table_scan_found_ids
+                else COLLECTOR_PROBE_INITIAL_CONCURRENT
+            )
+        )
+        if self.table_scan_tab_walk:
+            done_count = len(self.table_scan_probe_done)
+            ok_count = len(self.table_scan_probe_success)
+            fail_count = len(self.table_scan_probe_fail)
+            skip_count = len(getattr(self, "table_scan_probe_skip", set()) or set())
+            waiting = bool(self.table_scan_click_deadlines)
+            probe_text = (
+                f"tek yan sekme • {'masada veri bekliyor' if waiting else f'kalan {remaining_clicks} kart'} • "
+                f"tamam {done_count} OK {ok_count} atla {skip_count} hata {fail_count} • "
+            )
+        else:
+            probe_text = (
+                f"ek sekme hattı {probe_active}/{active_limit} aktif {probe_waiting} bekliyor • "
+                if active_limit > 0
+                else f"tek sekme tıklama • kalan görünen {remaining_clicks} • "
+            )
         with self.state.lock:
             self.state.table_scan_status = (
-                "MASA TARAMA: Rulet lobisi • "
-                f"{len(self.table_scan_visited)} kart / {table_count} masa ID • "
+                f"{prefix}: Rulet lobisi • "
+                f"{len(self.table_scan_visited)} kart / bu taramada {scan_id_count} gerçek masa ID "
+                f"/ kayıtlı banka {bank_count} • "
+                f"{probe_text}"
                 f"kaydırma {min(scroll_top + client_height, scroll_height)}/"
                 f"{scroll_height or 'bekleniyor'}"
             )
@@ -7288,6 +10297,24 @@ class ChromeBridge(threading.Thread):
         try:
             u = urllib.parse.urlsplit(raw)
             qs = urllib.parse.parse_qs(u.query)
+            casino_id = str((
+                qs.get("casinoId")
+                or qs.get("casinoID")
+                or qs.get("casinoid")
+                or [""]
+            )[0] or "")
+            currency = str((
+                qs.get("currency")
+                or qs.get("currencyId")
+                or qs.get("currencyID")
+                or [""]
+            )[0] or "")
+            if casino_id or currency:
+                self._record_dga_config(
+                    casino_id=casino_id,
+                    currency=currency,
+                    source="Pragmatic URL",
+                )
             if "/api/ge/versions" in u.path.lower():
                 game = str((qs.get("operatorGameId") or [""])[0] or "")
                 if game and sid:
@@ -7325,8 +10352,44 @@ class ChromeBridge(threading.Thread):
             self.state.mark_table_discovered(
                 table_id,
                 display_name=title,
-                source="AÇIK PRAGMATIC MASA",
+                source="API ÖĞREN" if self.manual_api_teach else "AÇIK PRAGMATIC MASA",
             )
+
+        if self.manual_api_teach:
+            with self.state.lock:
+                learned_count = len(self.state.table_registry)
+                self.state.table_scan_status = (
+                    f"MASA API ÖĞREN: {learned_count} masa öğrendi • "
+                    f"son: {title[:42]} • SON500/API bekleniyor"
+                )
+
+        if self._is_collector_session(sid):
+            self.table_scan_found_ids.add(table_id)
+            # V2.9.35: once the collector is back in the Pragmatic lobby, lobby
+            # preview/card API calls may still contain tableId. Do not recreate
+            # a table wait from those stale/lobby-preview requests; only extend
+            # the wait if a real card click is already in progress.
+            if self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                pass
+            else:
+                wait_seconds = (
+                    TAB_WALK_TABLE_TIMEOUT_SECONDS
+                    if self.table_scan_tab_walk
+                    else 8.0
+                )
+                self.table_scan_click_deadlines[sid] = now + wait_seconds
+                if self.table_scan_tab_walk:
+                    started = max([float(x or 0.0) for x in self.table_scan_click_started_at.values()] or [0.0])
+                    self.table_scan_click_started_at.setdefault(sid, started or now)
+                with self.state.lock:
+                    prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+                    self.state.table_scan_status = (
+                        f"{prefix}: tableId yakalandı • {table_id} • sağ-alt SON500 paneli bekleniyor"
+                    )
+                probe_tid = self._target_id_for_session(sid)
+                if probe_tid in self.table_scan_probe_targets:
+                    self.table_scan_probe_targets[probe_tid]["table_id_seen"] = table_id
+                    self.table_scan_probe_targets[probe_tid]["table_seen_at"] = now
 
         old = self.session_table_activity.get(sid, {})
         hits = (
@@ -7411,6 +10474,18 @@ class ChromeBridge(threading.Thread):
             try:
                 now = time.time()
 
+                if (
+                    self.table_scan_auto_cycle
+                    and not self.table_scan_enabled
+                    and not self.manual_api_teach
+                    and float(self.table_scan_next_cycle or 0.0) > 0.0
+                    and now >= float(self.table_scan_next_cycle or 0.0)
+                ):
+                    if self.table_scan_tab_walk:
+                        self.start_tab_walk_scan(auto_cycle=True)
+                    else:
+                        self.start_table_scan(auto_cycle=True)
+
                 # V2.9.5 ÖĞRET MODU:
                 # No blind scrolling and no generic text-based wandering.
                 # During training we only observe the user's own four clicks.
@@ -7484,6 +10559,34 @@ class ChromeBridge(threading.Thread):
                         )
 
                 for sid in list(self.session_info.keys()):
+                    if self.table_scan_enabled and self._is_collector_session(sid):
+                        due = float(self.table_scan_click_deadlines.get(sid, 0.0) or 0.0)
+                        if due and now >= due:
+                            if self.table_scan_tab_walk:
+                                probe_tid = self._target_id_for_session(sid)
+                                key = str(self.table_scan_current_click_key or probe_tid or sid)
+                                if probe_tid in self.table_scan_probe_targets:
+                                    row = self.table_scan_probe_targets[probe_tid]
+                                    key = str(row.get("key") or key)
+                                    row["done_at"] = now
+                                success_seen = key in self.table_scan_probe_success
+                                skip_seen = key in getattr(self, "table_scan_probe_skip", set())
+                                if not success_seen and not skip_seen:
+                                    self.table_scan_probe_done.add(key)
+                                    self.table_scan_probe_fail.add(key)
+                                self.table_scan_current_click_key = ""
+                                self.table_scan_current_click_label = ""
+                                if success_seen:
+                                    reason = "veri alındı"
+                                elif skip_seen:
+                                    reason = "SON500 yok • es geçildi"
+                                else:
+                                    reason = "veri zaman aşımı"
+                                self._return_collector_to_lobby(sid, reason)
+                            else:
+                                self._return_collector_to_lobby(sid, "masa denemesi tamamlandı")
+                            continue
+
                     if self.is_direct_probe_target(sid):
                         if now - float(last_visibility_scan.get(sid, 0.0)) >= 1.5:
                             last_visibility_scan[sid] = now
@@ -7632,12 +10735,106 @@ class ChromeBridge(threading.Thread):
                         # Preserve order while removing duplicate context ids.
                         scan_contexts = list(dict.fromkeys(scan_contexts))
                         for context_id in scan_contexts:
+                            returning_to_lobby = bool(
+                                self.table_scan_tab_walk
+                                and float(getattr(self, "table_scan_returning_until", 0.0) or 0.0) > now
+                            )
+                            wait_started = max(
+                                [float(x or 0.0) for x in self.table_scan_click_started_at.values()] or [0.0]
+                            )
+                            skip_runtime_direct = bool(
+                                self.table_scan_tab_walk
+                                and self.table_scan_click_deadlines
+                                and wait_started
+                                and now - wait_started < 8.0
+                                and not returning_to_lobby
+                            )
+                            direct_key = (sid, context_id, "collector_direct")
+                            if (not skip_runtime_direct) and now - float(last_direct_scan.get(direct_key, 0.0)) >= 2.0:
+                                last_direct_scan[direct_key] = now
+                                direct_params = {
+                                    "expression": DIRECT_HISTORY_SCAN,
+                                    "returnByValue": True,
+                                    "awaitPromise": True,
+                                }
+                                if context_id is not None:
+                                    direct_params["contextId"] = int(context_id)
+                                self.send(
+                                    "Runtime.evaluate",
+                                    direct_params,
+                                    session_id=sid,
+                                    kind="directhistory",
+                                    context={
+                                        "session": sid,
+                                        "context_id": context_id,
+                                        "origin": "collector",
+                                        "name": "collector",
+                                    },
+                                )
+
+                            # V2.9.33: in single-tab mode read visible SON 500
+                            # only while a clicked table is actually being
+                            # waited on. Do not keep scanning stale tableId after
+                            # returning to the lobby; that caused confusing
+                            # 'bulunan 0' statuses in the lobby.
+                            collector_tid = str(
+                                (self.session_table_activity.get(sid, {}) or {}).get("table_id", "")
+                                or ""
+                            )
+                            fallback_tid, fallback_title = self._collector_table_identity(
+                                sid,
+                                real_table_id=collector_tid,
+                                title=str(
+                                    self.session_info.get(sid, {}).get("title", "")
+                                    or self.table_scan_current_click_label
+                                ),
+                            )
+                            history_active = bool(
+                                self.table_scan_click_deadlines
+                                or self.table_scan_current_click_key
+                                or collector_tid
+                            )
+                            if self.table_scan_tab_walk and history_active and not returning_to_lobby:
+                                hist_key = (sid, context_id, "collector_history500")
+                                if now - float(last_500_scan.get(hist_key, 0.0)) >= 1.4:
+                                    last_500_scan[hist_key] = now
+                                    hist_params = {
+                                        "expression": HISTORY500_SCAN,
+                                        "returnByValue": True,
+                                        "awaitPromise": True,
+                                    }
+                                    if context_id is not None:
+                                        hist_params["contextId"] = int(context_id)
+                                    self.send(
+                                        "Runtime.evaluate",
+                                        hist_params,
+                                        session_id=sid,
+                                        kind="background500",
+                                        context={
+                                            "session": sid,
+                                            "table_id": fallback_tid,
+                                            "real_table_id": collector_tid,
+                                            "title": fallback_title,
+                                            "collector": True,
+                                        },
+                                    )
+
+                            if (
+                                self.table_scan_tab_walk
+                                and self.table_scan_click_deadlines
+                                and not returning_to_lobby
+                            ):
+                                continue
+
                             scan_key = (sid, context_id)
-                            if now - float(last_table_nav_scan.get(scan_key, 0.0)) < 2.0:
+                            if now - float(last_table_nav_scan.get(scan_key, 0.0)) < (0.8 if self.table_scan_tab_walk else 2.0):
                                 continue
                             last_table_nav_scan[scan_key] = now
                             params = {
-                                "expression": build_multi_table_nav_scan(),
+                                "expression": build_multi_table_nav_scan(
+                                    self.table_scan_clicked_keys,
+                                    click_cards=True,
+                                ),
                                 "returnByValue": True,
                                 "awaitPromise": True,
                             }
@@ -7656,6 +10853,8 @@ class ChromeBridge(threading.Thread):
 
                 self._select_active_table()
                 self._collector_tick()
+                self._poll_chrome_dga_runtime()
+                self._pump_table_scan_probes()
             except Exception:
                 pass
 
@@ -7734,6 +10933,8 @@ class ChromeBridge(threading.Thread):
                 })
                 merged.setdefault("last_requested", 0.0)
                 self.collector_seen[tid] = merged
+                if self.table_scan_enabled:
+                    self.table_scan_found_ids.add(tid)
                 if should_persist:
                     persist_rows.append((tid, name))
                 count += 1
@@ -7741,7 +10942,7 @@ class ChromeBridge(threading.Thread):
             self.state.mark_table_discovered(tid, name, source=source)
         return count
 
-    def _start_background_history_request(self, template, table_id, display_name=""):
+    def _start_background_history_request(self, template, table_id, display_name="", force=False):
         if not isinstance(template, dict):
             return False
         tid = str(table_id or "").strip()
@@ -7757,7 +10958,7 @@ class ChromeBridge(threading.Thread):
             registry_row = dict(self.state.table_registry.get(tid, {}) or {})
         last_success = float(registry_row.get("last_update_epoch", 0.0) or 0.0)
         last_attempt = float(registry_row.get("last_attempt_epoch", 0.0) or 0.0)
-        if not collector_refresh_due(
+        if not force and not collector_refresh_due(
             now,
             last_success,
             last_attempt,
@@ -7768,7 +10969,7 @@ class ChromeBridge(threading.Thread):
             if key in self.collector_inflight:
                 return False
             seen = self.collector_seen.setdefault(tid, {})
-            if now - float(seen.get("last_requested", 0.0) or 0.0) < 1.0:
+            if not force and now - float(seen.get("last_requested", 0.0) or 0.0) < 1.0:
                 return False
             seen["last_requested"] = now
             self.collector_inflight.add(key)
@@ -7803,7 +11004,60 @@ class ChromeBridge(threading.Thread):
                     source_label="MULTI TABLE statisticHistory",
                 )
                 self.state.mark_table_attempt(tid, ok=True)
+                if self.api_refresh_mode:
+                    with self.collector_lock:
+                        self.api_refresh_success = int(self.api_refresh_success or 0) + 1
+                if self.table_scan_enabled and tid in self.table_scan_found_ids:
+                    now_done = time.time()
+                    for scan_sid in list(self.table_scan_click_deadlines.keys()):
+                        if self.table_scan_tab_walk:
+                            self._schedule_collector_return(scan_sid, 0.8)
+                        else:
+                            self.table_scan_click_deadlines[scan_sid] = min(
+                                float(self.table_scan_click_deadlines.get(scan_sid, now_done + 1.0) or 0.0),
+                                now_done + 1.0,
+                            )
+                    for probe_tid, probe_row in list(self.table_scan_probe_targets.items()):
+                        if str(probe_row.get("table_id_seen") or probe_row.get("table_id") or "") == tid:
+                            probe_row["done_at"] = now_done
+                            probe_key = str(probe_row.get("key") or probe_tid)
+                            self.table_scan_probe_done.add(probe_key)
+                            self.table_scan_probe_success.add(probe_key)
+                    with self.state.lock:
+                        prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+                        self.state.table_scan_status = (
+                            f"{prefix}: API SON500 kaydedildi • {str(display_name or tid)[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
+                            if self.table_scan_tab_walk
+                            else f"{prefix}: veri alındı • {tid} • sıradaki masaya geçiliyor"
+                        )
             except Exception as exc:
+                if self.api_refresh_mode:
+                    with self.collector_lock:
+                        self.api_refresh_fail = int(self.api_refresh_fail or 0) + 1
+                if self.table_scan_enabled and tid in self.table_scan_found_ids:
+                    now_fail = time.time()
+                    if self.table_scan_tab_walk:
+                        # Python/API fallback can fail before the visible table
+                        # finishes loading. Do not close the real tab for this;
+                        # keep waiting for Chrome network/DOM SON500 until the
+                        # per-table timeout expires.
+                        for scan_sid in list(self.table_scan_click_deadlines.keys()):
+                            self.table_scan_click_deadlines[scan_sid] = max(
+                                float(self.table_scan_click_deadlines.get(scan_sid, 0.0) or 0.0),
+                                now_fail + 12.0,
+                            )
+                    else:
+                        for scan_sid in list(self.table_scan_click_deadlines.keys()):
+                            self.table_scan_click_deadlines[scan_sid] = min(
+                                float(self.table_scan_click_deadlines.get(scan_sid, now_fail + 2.0) or 0.0),
+                                now_fail + 2.0,
+                            )
+                        for probe_tid, probe_row in list(self.table_scan_probe_targets.items()):
+                            if str(probe_row.get("table_id_seen") or probe_row.get("table_id") or "") == tid:
+                                probe_row["done_at"] = now_fail
+                                probe_key = str(probe_row.get("key") or probe_tid)
+                                self.table_scan_probe_done.add(probe_key)
+                                self.table_scan_probe_fail.add(probe_key)
                 self.state.mark_table_attempt(
                     tid,
                     error=f"{type(exc).__name__}: {exc}",
@@ -7819,6 +11073,171 @@ class ChromeBridge(threading.Thread):
         ).start()
         return True
 
+    def start_manual_api_teach(self):
+        """Reset the visible bank and learn table APIs while user opens tables."""
+        self.table_scan_enabled = False
+        self.table_scan_auto_cycle = False
+        self.table_scan_next_cycle = 0.0
+        self.table_scan_tab_walk = False
+        self.chrome_dga_enabled = False
+        try:
+            self.dga_feed.stop_collection("API öğren modu")
+        except Exception:
+            pass
+        self._close_table_scan_target()
+        self.manual_api_teach = True
+        self.manual_api_teach_started = time.time()
+        self.collector_seen.clear()
+        self.direct_api_seen.clear()
+        self.state.clear_table_registry("API öğren başladı")
+        with self.state.lock:
+            self.state.table_scan_status = (
+                "MASA API ÖĞREN: açık • bankayı sıfırladım • "
+                "masaları tek tek sen aç, API/tableId kaydedilecek"
+            )
+        return True
+
+    def start_api_refresh_all(self):
+        """Refresh known tableId banks through Pragmatic DGA live websocket.
+
+        Earlier statisticHistory HTTP refreshes returned OK 0 on the user's
+        operator because the endpoint is bound to browser/runtime context. The
+        public GitHub examples for Pragmatic live roulette use the DGA websocket;
+        use that as the primary bank refresh path.
+        """
+        rows = []
+        with self.collector_lock:
+            seen_rows = {
+                str(k): dict(v or {})
+                for k, v in (self.collector_seen or {}).items()
+            }
+        with self.state.lock:
+            registry_rows = {
+                str(k): dict(v or {})
+                for k, v in (self.state.table_registry or {}).items()
+            }
+        merged = {}
+        merged.update(seen_rows)
+        for tid, row in registry_rows.items():
+            old = dict(merged.get(tid, {}) or {})
+            old.update(row)
+            old.setdefault("table_id", tid)
+            merged[tid] = old
+        for tid, row in merged.items():
+            if str(tid).strip():
+                rows.append({
+                    "table_id": str(tid).strip(),
+                    "display_name": str(row.get("display_name") or tid),
+                    "last_requested": 0.0,
+                })
+        rows.sort(key=lambda row: row["display_name"].lower())
+
+        with self.collector_lock:
+            self.api_refresh_remaining = []
+            self.api_refresh_total = len(rows)
+            self.api_refresh_started = time.time()
+            self.api_refresh_success = 0
+            self.api_refresh_fail = 0
+            self.api_refresh_mode = False
+            for row in rows:
+                tid = str(row.get("table_id") or "")
+                if tid:
+                    old = self.collector_seen.get(tid, {}) or {}
+                    merged_row = dict(old)
+                    merged_row.update(row)
+                    self.collector_seen[tid] = merged_row
+
+        if not rows:
+            with self.state.lock:
+                self.state.table_scan_status = "DGA CANLI: kayıtlı masa bankası yok"
+            return False
+
+        self.start_dga_live_collection("KAYITLI MASALARI API/DGA YENİLE")
+        with self.state.lock:
+            self.state.table_scan_status = (
+                f"DGA CANLI: {len(rows)} kayıtlı masa aboneliği başladı • "
+                "yeni spin geldikçe arşive eklenecek"
+            )
+        return True
+
+    def _api_refresh_runtime_context(self):
+        """Pick a Chrome Runtime context that can fetch Pragmatic games APIs."""
+        candidates = []
+        sids = []
+        if self.active_game_sid:
+            sids.append(self.active_game_sid)
+        sids.extend([sid for sid in self.session_info.keys() if sid not in sids])
+        for sid in sids:
+            if self._is_collector_session(sid):
+                continue
+            if not self.is_direct_probe_target(sid):
+                continue
+            info = self.session_info.get(sid, {}) or {}
+            url = str(info.get("url", "") or "").lower()
+            title = str(info.get("title", "") or "").lower()
+            base_score = 0
+            if sid == self.active_game_sid:
+                base_score += 1000
+            if "pragmatic" in url or "pragmatic" in title:
+                base_score += 100
+            if "roulette" in url or "rulet" in url or "roulette" in title or "rulet" in title:
+                base_score += 80
+            contexts = list((self.execution_contexts.get(sid) or {}).values())
+            for ctx in contexts:
+                cid = ctx.get("id")
+                origin = str(ctx.get("origin") or "").lower()
+                if cid is None:
+                    continue
+                score = base_score
+                if "games." in origin:
+                    score += 500
+                if origin.startswith(("http://", "https://")):
+                    score += 20
+                candidates.append((score, sid, int(cid)))
+            candidates.append((base_score, sid, None))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda row: -row[0])
+        _score, sid, cid = candidates[0]
+        return sid, cid
+
+    def _start_api_refresh_runtime_request(self, row):
+        tid = str((row or {}).get("table_id") or "").strip()
+        if not tid:
+            return False
+        sid, context_id = self._api_refresh_runtime_context()
+        if not sid:
+            return False
+        key = ("runtime", tid)
+        now = time.time()
+        with self.collector_lock:
+            if key in self.collector_inflight:
+                return False
+            self.collector_inflight.add(key)
+        self.state.mark_table_attempt(tid)
+        params = {
+            "expression": build_table_api_history_fetch(tid),
+            "returnByValue": True,
+            "awaitPromise": True,
+        }
+        if context_id is not None:
+            params["contextId"] = int(context_id)
+        self.send(
+            "Runtime.evaluate",
+            params,
+            session_id=sid,
+            kind="apirefreshruntime",
+            context={
+                "table_id": tid,
+                "display_name": str((row or {}).get("display_name") or tid),
+                "key": key,
+                "session": sid,
+                "context_id": context_id,
+                "started": now,
+            },
+        )
+        return True
+
     def _collector_tick(self):
         now = time.time()
         with self.collector_lock:
@@ -7827,15 +11246,80 @@ class ChromeBridge(threading.Thread):
                 if now - float(row.get("seen", 0.0) or 0.0) <= 900.0
             ]
             candidates = [dict(row) for row in self.collector_seen.values()]
+            api_mode = bool(getattr(self, "api_refresh_mode", False))
+            api_remaining = list(getattr(self, "api_refresh_remaining", []) or [])
+            api_total = int(getattr(self, "api_refresh_total", 0) or 0)
         if not templates:
             return
         templates.sort(key=lambda row: float(row.get("seen", 0.0) or 0.0), reverse=True)
         template = templates[0]
-        candidates.sort(key=lambda row: float(row.get("last_requested", 0.0) or 0.0))
         with self.collector_lock:
             available = COLLECTOR_MAX_CONCURRENT - len(self.collector_inflight)
+            inflight_now = len(self.collector_inflight)
+            ok_now = int(getattr(self, "api_refresh_success", 0) or 0)
+            fail_now = int(getattr(self, "api_refresh_fail", 0) or 0)
         if available <= 0:
+            if api_mode:
+                with self.state.lock:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: çalışıyor • OK {ok_now} / HATA {fail_now} • "
+                        f"{inflight_now} aktif • {len(api_remaining)} bekliyor"
+                    )
             return
+
+        if api_mode:
+            dispatched = 0
+            kept = []
+            for row in api_remaining:
+                if available <= 0:
+                    kept.append(row)
+                    continue
+                if self._start_api_refresh_runtime_request(row):
+                    available -= 1
+                    dispatched += 1
+                elif self._start_background_history_request(
+                    template,
+                    row.get("table_id", ""),
+                    row.get("display_name", ""),
+                    force=True,
+                ):
+                    available -= 1
+                    dispatched += 1
+                else:
+                    # If already inflight or no suitable context yet, keep it
+                    # queued; the API refresh will continue on the next tick.
+                    kept.append(row)
+            with self.collector_lock:
+                self.api_refresh_remaining = kept
+                remaining = len(self.api_refresh_remaining)
+                inflight = len(self.collector_inflight)
+                ok_now = int(getattr(self, "api_refresh_success", 0) or 0)
+                fail_now = int(getattr(self, "api_refresh_fail", 0) or 0)
+                if remaining == 0 and inflight == 0:
+                    self.api_refresh_mode = False
+            done = max(0, api_total - remaining)
+            fallback_lobby = bool(remaining == 0 and inflight == 0 and ok_now == 0 and fail_now > 0)
+            with self.state.lock:
+                if fallback_lobby:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: OK 0 / HATA {fail_now} • "
+                        "lobi sekme toplayıcıya geçiliyor"
+                    )
+                elif remaining == 0 and inflight == 0:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: tamamlandı • OK {ok_now} / HATA {fail_now} • "
+                        f"{done}/{api_total} masa denendi"
+                    )
+                else:
+                    self.state.table_scan_status = (
+                        f"API TOPLA: {done}/{api_total} gönderildi • OK {ok_now} / HATA {fail_now} • "
+                        f"{inflight} aktif • {remaining} bekliyor"
+                    )
+            if fallback_lobby:
+                self.start_table_scan(auto_cycle=True)
+            return
+
+        candidates.sort(key=lambda row: float(row.get("last_requested", 0.0) or 0.0))
         for row in candidates:
             if available <= 0:
                 break
@@ -7940,13 +11424,56 @@ class ChromeBridge(threading.Thread):
                 body=base64.b64decode(body).decode("utf-8",errors="ignore")
             meta=context if isinstance(context,dict) else {}
             table_id = str(meta.get("table_id","") or "")
+            sid_ctx = str(meta.get("session","") or "")
+            nums=extract_statistic_history(body)
+
+            if sid_ctx and self._is_collector_session(sid_ctx):
+                if table_id:
+                    self.table_scan_found_ids.add(table_id)
+                if self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                    return
+                if table_id and len(nums) >= 20:
+                    display_name = self._clean_collector_label(
+                        str(meta.get("title") or self.table_scan_last_clicked_label or table_id),
+                        fallback=table_id,
+                    )
+                    self.state.store_background_table_history(
+                        nums,
+                        table_id=table_id,
+                        display_name=display_name,
+                        source_label="SEKMELİ TOPLA statisticHistory network",
+                    )
+                    self.state.mark_table_attempt(table_id, ok=True)
+                    now_done = time.time()
+                    self._schedule_collector_return(sid_ctx, 0.8)
+                    probe_tid = self._target_id_for_session(sid_ctx)
+                    if probe_tid in self.table_scan_probe_targets:
+                        row = self.table_scan_probe_targets[probe_tid]
+                        row["done_at"] = now_done
+                        row["table_id_seen"] = table_id
+                        key = str(row.get("key") or probe_tid)
+                    else:
+                        key = str(self.table_scan_current_click_key or sid_ctx)
+                    self.table_scan_probe_done.add(key)
+                    self.table_scan_probe_success.add(key)
+                    with self.state.lock:
+                        prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+                        self.state.table_scan_status = (
+                            f"{prefix}: NETWORK SON500 kaydedildi • {display_name[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
+                        )
+                elif table_id and self.table_scan_tab_walk:
+                    with self.state.lock:
+                        self.state.table_scan_status = (
+                            f"SEKMELİ TOPLA: network cevap var ama SON500 ayrıştırılamadı ({len(nums)}) • bekleniyor"
+                        )
+                return
+
             if (
                 self.active_table_id
                 and table_id
                 and table_id != self.active_table_id
             ):
                 return
-            nums=extract_statistic_history(body)
             self.state.update_direct_pragmatic_history(
                 nums,
                 table_id=meta.get("table_id",""),
@@ -7973,6 +11500,61 @@ class ChromeBridge(threading.Thread):
             theme_code=str(value.get("themeCode") or "")
             title=str(value.get("title") or "")
             sid_ctx = str(ctx_meta.get("session","") or "")
+
+            if sid_ctx and self._is_collector_session(sid_ctx):
+                if table_id:
+                    self.table_scan_found_ids.add(table_id)
+                if self.table_scan_tab_walk and not self.table_scan_click_deadlines:
+                    return
+                if value.get("ok") and value.get("body") and table_id:
+                    nums = extract_statistic_history(value.get("body"))
+                    if len(nums) >= 20:
+                        display_name = self._clean_collector_label(
+                            title or self.table_scan_last_clicked_label or table_id,
+                            fallback=table_id,
+                        )
+                        self.state.store_background_table_history(
+                            nums,
+                            table_id=table_id,
+                            display_name=display_name,
+                            source_label="CLICK SCAN statisticHistory",
+                        )
+                        self.state.mark_table_attempt(table_id, ok=True)
+                        now_done = time.time()
+                        self._schedule_collector_return(sid_ctx, 0.8)
+                        probe_tid = self._target_id_for_session(sid_ctx)
+                        if probe_tid in self.table_scan_probe_targets:
+                            row = self.table_scan_probe_targets[probe_tid]
+                            row["done_at"] = now_done
+                            key = str(row.get("key") or probe_tid)
+                        else:
+                            key = str(self.table_scan_current_click_key or sid_ctx)
+                        self.table_scan_probe_done.add(key)
+                        self.table_scan_probe_success.add(key)
+                        with self.state.lock:
+                            prefix = "SEKMELİ TOPLA" if self.table_scan_tab_walk else "MASA TARAMA"
+                            self.state.table_scan_status = (
+                                f"{prefix}: runtime SON500 kaydedildi • {display_name[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
+                            )
+                    elif table_id:
+                        # tableId arrived but usable SON500/statisticHistory has not
+                        # arrived yet. In sekmeli mode do NOT close early; the
+                        # tab stays open until real data or timeout.
+                        if self.table_scan_tab_walk:
+                            self.table_scan_click_deadlines[sid_ctx] = max(
+                                float(self.table_scan_click_deadlines.get(sid_ctx, 0.0) or 0.0),
+                                time.time() + 12.0,
+                            )
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: tableId {table_id} • veri henüz yok • bekleniyor"
+                                )
+                        else:
+                            self.table_scan_click_deadlines[sid_ctx] = min(
+                                float(self.table_scan_click_deadlines.get(sid_ctx, time.time() + 2.0) or 0.0),
+                                time.time() + 2.0,
+                            )
+                return
 
             if table_id:
                 if self.active_table_id and table_id != self.active_table_id:
@@ -8039,7 +11621,7 @@ class ChromeBridge(threading.Thread):
 
             meta = context if isinstance(context, dict) else {}
             discovered = extract_pragmatic_roulette_tables(body)
-            if discovered:
+            if discovered and not self.manual_api_teach:
                 source_url = urllib.parse.urlsplit(str(meta.get("url") or ""))
                 source_label = (
                     f"{source_url.scheme}://{source_url.netloc}{source_url.path}"
@@ -8051,10 +11633,54 @@ class ChromeBridge(threading.Thread):
                     source=source_label[:140],
                 )
 
-            # Lobby/game responses from the dedicated background tab are
-            # discovery data only. They must never replace the open table's
-            # live history or prediction input.
-            if self._is_collector_session(str(meta.get("session") or "")):
+            # V2.9.33: while the single-tab collector is inside a real table,
+            # accept generic network history only from history/stat/result-like
+            # endpoints. Do not treat lobby/game-list JSON as a table success;
+            # that made the tab leave the table too quickly.
+            collector_sid = str(meta.get("session") or "")
+            if self._is_collector_session(collector_sid):
+                if self.table_scan_tab_walk and self.table_scan_click_deadlines:
+                    source_url = str(meta.get("url") or "")
+                    low_url = source_url.lower()
+                    historyish = any(x in low_url for x in (
+                        "statistic", "history", "recent", "result", "round",
+                        "shoe", "roadmap", "statistics"
+                    ))
+                    if historyish:
+                        nums = extract_statistic_history(body)
+                        if len(nums) >= 20:
+                            try:
+                                u = urllib.parse.urlsplit(source_url)
+                                qs = urllib.parse.parse_qs(u.query)
+                                real_tid = str((qs.get("tableId") or [""])[0] or "")
+                            except Exception:
+                                real_tid = ""
+                            if not real_tid:
+                                real_tid = str(
+                                    (self.session_table_activity.get(collector_sid, {}) or {}).get("table_id", "")
+                                    or ""
+                                )
+                            table_id, display_name = self._collector_table_identity(
+                                collector_sid,
+                                real_table_id=real_tid,
+                                title=str(self.table_scan_last_clicked_label or ""),
+                            )
+                            self.state.store_background_table_history(
+                                nums,
+                                table_id=table_id,
+                                display_name=display_name,
+                                source_label="SEKMELİ TOPLA genel network SON500",
+                            )
+                            self.state.mark_table_attempt(table_id, ok=True)
+                            now_done = time.time()
+                            self._schedule_collector_return(collector_sid, 0.8)
+                            key = str(self.table_scan_current_click_key or table_id)
+                            self.table_scan_probe_done.add(key)
+                            self.table_scan_probe_success.add(key)
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: genel network SON500 kaydedildi • {display_name[:44]} • {len(nums)}/500 • panel bekleme tamamlanınca lobiye dönülecek"
+                                )
                 return
 
             if "last20Results" not in body:
@@ -8113,6 +11739,24 @@ class ChromeBridge(threading.Thread):
                             "MASA TARAMA: arka plan sekmesi açılamadı"
                         )
 
+            elif kind == "collectorprobecreate":
+                tid = str(obj.get("result", {}).get("targetId", "") or "")
+                meta = context if isinstance(context, dict) else {}
+                if tid and self.table_scan_enabled:
+                    row = dict(meta)
+                    row["opened"] = time.time()
+                    self.table_scan_probe_targets[tid] = row
+                    url = str(row.get("url") or "")
+                    if url:
+                        self.table_scan_probe_urls.add(url)
+                    ti = self.target_info.get(tid)
+                    if ti:
+                        self.attach_target(ti)
+                else:
+                    url = str(meta.get("url") or "")
+                    if url:
+                        self.table_scan_probe_urls.discard(url)
+
             elif kind == "attach":
                 tid = context
                 self.attaching.discard(tid)
@@ -8132,7 +11776,56 @@ class ChromeBridge(threading.Thread):
             elif kind == "directhistory":
                 self.handle_direct_runtime(obj, context)
 
-            elif kind == "lobbyteach":
+            elif kind == "chromedgastart":
+                self._handle_chrome_dga_runtime(obj, context, started=True)
+
+            elif kind == "chromedgapoll":
+                self._handle_chrome_dga_runtime(obj, context, started=False)
+
+            elif kind == "chromedgastop":
+                pass
+
+            elif kind == "apirefreshruntime":
+                meta = context if isinstance(context, dict) else {}
+                tid = str(meta.get("table_id") or "")
+                key = meta.get("key") or ("runtime", tid)
+                ok = False
+                err = ""
+                try:
+                    value = obj.get("result", {}).get("result", {}).get("value")
+                    if not isinstance(value, dict):
+                        err = "runtime cevap yok"
+                    elif value.get("ok") and value.get("body"):
+                        nums = extract_statistic_history(value.get("body"))
+                        if len(nums) >= 20:
+                            self.state.store_background_table_history(
+                                nums,
+                                table_id=tid or value.get("tableId", ""),
+                                display_name=str(meta.get("display_name") or value.get("title") or tid),
+                                source_label="API REFRESH runtime fetch",
+                            )
+                            self.state.mark_table_attempt(tid, ok=True)
+                            ok = True
+                        else:
+                            err = f"sonuç ayrıştırılamadı ({len(nums)})"
+                    else:
+                        err = str(
+                            (value or {}).get("reason")
+                            or f"HTTP {(value or {}).get('status','-')}"
+                        )
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+                finally:
+                    with self.collector_lock:
+                        self.collector_inflight.discard(key)
+                        if ok:
+                            self.api_refresh_success = int(getattr(self, "api_refresh_success", 0) or 0) + 1
+                        else:
+                            self.api_refresh_fail = int(getattr(self, "api_refresh_fail", 0) or 0) + 1
+                    if not ok and tid:
+                        self.state.mark_table_attempt(tid, error=err[:160])
+
+            elif kind == "lobbyteach": 
                 try:
                     value = obj.get("result",{}).get("result",{}).get("value")
                     self._handle_lobby_teach(str(context or ""), value)
@@ -8178,6 +11871,38 @@ class ChromeBridge(threading.Thread):
                 try:
                     value = obj.get("result",{}).get("result",{}).get("value")
                     self._handle_table_nav_scan(context, value)
+                except Exception:
+                    pass
+
+            elif kind == "collectorback":
+                try:
+                    value = obj.get("result",{}).get("result",{}).get("value")
+                    if isinstance(value, dict):
+                        stage = str(value.get("stage") or "")
+                        clicked = bool(value.get("clicked"))
+                        if clicked:
+                            now_back = time.time()
+                            self.table_scan_last_view = now_back
+                            if self.table_scan_tab_walk:
+                                self.table_scan_returning_until = max(
+                                    float(getattr(self, "table_scan_returning_until", 0.0) or 0.0),
+                                    now_back + TAB_WALK_RETURN_GRACE_SECONDS,
+                                )
+                                for scan_sid in list(self.session_info.keys()):
+                                    if self._is_collector_session(scan_sid):
+                                        self.table_scan_click_deadlines.pop(scan_sid, None)
+                                        self.table_scan_click_started_at.pop(scan_sid, None)
+                                        self.session_table_activity.pop(scan_sid, None)
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    "SEKMELİ TOPLA: oyun içi Lobi düğmesi tıklandı • Pragmatic Rulet lobisi bekleniyor"
+                                )
+                        elif stage == "lobby-button-not-found":
+                            with self.state.lock:
+                                if "Lobi düğmesine basılıyor" in str(self.state.table_scan_status):
+                                    self.state.table_scan_status = (
+                                        "SEKMELİ TOPLA: oyun içi Lobi düğmesi aranıyor • arama sayfasına dönülmeyecek"
+                                    )
                 except Exception:
                     pass
 
@@ -8246,14 +11971,174 @@ class ChromeBridge(threading.Thread):
                             value.get("title","")
                             or meta.get("title","")
                         )
-                        table_id = str(meta.get("table_id","") or "")
-                        if len(nums) >= 20 and table_id:
+                        raw_table_id = str(meta.get("table_id","") or "")
+                        is_collector = bool(meta.get("collector"))
+                        panel_seen = bool(
+                            value.get("autoFound")
+                            or value.get("foundTab")
+                            or str(value.get("source") or "") in ("auto-button", "son500-tab")
+                        )
+                        sid_meta = str(meta.get("session") or "")
+                        table_id, display_name = self._collector_table_identity(
+                            sid_meta,
+                            real_table_id=str(meta.get("real_table_id") or raw_table_id),
+                            title=title,
+                        ) if is_collector else (raw_table_id, title)
+                        now_value = time.time()
+                        returning_to_lobby = bool(
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and float(getattr(self, "table_scan_returning_until", 0.0) or 0.0) > now_value
+                        )
+                        recent_lobby_visible = bool(
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and not self.table_scan_current_click_key
+                            and float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0)
+                            and now_value - float(getattr(self, "table_scan_lobby_seen_at", 0.0) or 0.0) <= 30.0
+                        )
+                        if (returning_to_lobby or recent_lobby_visible) and not bool(value.get("lobbyLike")):
+                            return
+                        blocked_or_no_son500 = bool(
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and self.table_scan_click_deadlines
+                            and (
+                                value.get("blockedTable")
+                                or value.get("gameNoSon500")
+                                or value.get("hotColdOnly")
+                                or self._is_blocked_table_label(display_name)
+                                or self._is_blocked_table_label(self.table_scan_current_click_label)
+                                or self._is_blocked_table_label(self.table_scan_last_clicked_label)
+                            )
+                        )
+                        if blocked_or_no_son500:
+                            key = str(self.table_scan_current_click_key or table_id or sid_meta)
+                            if key:
+                                self.table_scan_probe_done.add(key)
+                                self.table_scan_probe_skip.add(key)
+                            return_sid = (
+                                sid_meta
+                                or next(iter(self.table_scan_click_deadlines.keys()), "")
+                                or self._collector_root_session()
+                            )
+                            reason = "bloklu masa" if (
+                                value.get("blockedTable")
+                                or self._is_blocked_table_label(display_name)
+                                or self._is_blocked_table_label(self.table_scan_current_click_label)
+                                or self._is_blocked_table_label(self.table_scan_last_clicked_label)
+                            ) else "SON500 paneli yok"
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: {reason} • {display_name[:44]} • anında es geçiliyor"
+                                )
+                            self._return_collector_to_lobby(return_sid, f"{reason} • es geçildi")
+                            self.table_scan_current_click_key = ""
+                            self.table_scan_current_click_label = ""
+                            return
+                        if is_collector and bool(value.get("lobbyLike")):
+                            self.table_scan_returning_until = 0.0
+                            self.table_scan_lobby_seen_at = time.time()
+                            for scan_sid in list(self.session_info.keys()):
+                                if self._is_collector_session(scan_sid):
+                                    self.table_scan_click_deadlines.pop(scan_sid, None)
+                                    self.table_scan_click_started_at.pop(scan_sid, None)
+                                    self.session_table_activity.pop(scan_sid, None)
+                            self.table_scan_current_click_key = ""
+                            self.table_scan_current_click_label = ""
+                            with self.state.lock:
+                                self.state.table_scan_status = (
+                                    f"SEKMELİ TOPLA: Pragmatic Rulet lobisine dönüldü • {int(value.get('lobbyCardCount',0) or 0)} kart • sıradaki masa seçiliyor"
+                                )
+                            return
+                        if (
+                            is_collector
+                            and self.table_scan_tab_walk
+                            and not self.table_scan_click_deadlines
+                            and not (
+                                panel_seen
+                                or value.get("gameNoSon500")
+                                or value.get("blockedTable")
+                                or value.get("hotColdOnly")
+                                or value.get("foundTab")
+                            )
+                        ):
+                            return
+                        if len(nums) >= 20 and table_id and ((not is_collector) or panel_seen):
+                            source_label = (
+                                "SEKMELİ TOPLA sağ-alt SON500 paneli"
+                                if is_collector
+                                else "ARKA PLAN SON500"
+                            )
                             self.state.store_background_table_history(
                                 nums,
                                 table_id=table_id,
-                                display_name=title,
-                                source_label="ARKA PLAN SON500",
+                                display_name=display_name,
+                                source_label=source_label,
                             )
+                            self.state.mark_table_attempt(table_id, ok=True)
+                            if is_collector:
+                                sid_ctx = str(meta.get("session") or "")
+                                now_done = time.time()
+                                if sid_ctx:
+                                    self._schedule_collector_return(sid_ctx, 0.8)
+                                key = str(self.table_scan_current_click_key or table_id)
+                                self.table_scan_probe_done.add(key)
+                                self.table_scan_probe_success.add(key)
+                                with self.state.lock:
+                                    self.state.table_scan_status = (
+                                        f"SEKMELİ TOPLA: sağ-alt SON500 paneli kaydedildi • {display_name[:44]} • {len(nums)}/500 • minimum bekleme sonrası lobiye dönülecek"
+                                    )
+                        elif is_collector and table_id:
+                            now_wait = time.time()
+                            started = 0.0
+                            if sid_meta:
+                                started = float(self.table_scan_click_started_at.get(sid_meta, 0.0) or 0.0)
+                            if not started:
+                                for v in self.table_scan_click_started_at.values():
+                                    try:
+                                        started = max(started, float(v or 0.0))
+                                    except Exception:
+                                        pass
+                            elapsed = max(0.0, now_wait - started) if started else 0.0
+                            has_son500_tab = bool(value.get("foundTab") or str(value.get("source") or "") == "son500-tab")
+                            skip_no_panel = elapsed >= TAB_WALK_NO_SON500_SKIP_SECONDS and not has_son500_tab
+                            skip_empty_panel = elapsed >= TAB_WALK_EMPTY_SON500_SKIP_SECONDS and has_son500_tab and len(nums) < 20
+                            if skip_no_panel or skip_empty_panel:
+                                key = str(self.table_scan_current_click_key or table_id)
+                                self.table_scan_probe_done.add(key)
+                                self.table_scan_probe_skip.add(key)
+                                return_sid = (
+                                    sid_meta
+                                    or next(iter(self.table_scan_click_deadlines.keys()), "")
+                                    or self._collector_root_session()
+                                )
+                                with self.state.lock:
+                                    self.state.table_scan_status = (
+                                        f"SEKMELİ TOPLA: SON500 yok • {display_name[:44]} • es geçiliyor"
+                                    )
+                                # V2.9.37: do not merely schedule this return;
+                                # repeated DOM scans could keep refreshing the
+                                # due time and leave the UI stuck at
+                                # "es geçiliyor". Clear the wait and click the
+                                # in-game Lobby button immediately.
+                                self._return_collector_to_lobby(
+                                    return_sid,
+                                    "SON500 yok • es geçildi",
+                                )
+                                self.table_scan_current_click_key = ""
+                                self.table_scan_current_click_label = ""
+                            else:
+                                with self.state.lock:
+                                    if has_son500_tab:
+                                        panel_text = "SON500 paneli görüldü"
+                                    elif panel_seen:
+                                        panel_text = "masa paneli var, SON500 aranıyor"
+                                    else:
+                                        panel_text = "masa paneli bekleniyor"
+                                    self.state.table_scan_status = (
+                                        f"SEKMELİ TOPLA: sağ-alt SON500 okunuyor • {display_name[:44]} • {panel_text} • bulunan {len(nums)}"
+                                    )
                 except Exception:
                     pass
 
@@ -8373,7 +12258,34 @@ class ChromeBridge(threading.Thread):
                     for tid in dead:
                         self.target_sessions.pop(tid, None)
                         self.target_parent.pop(tid, None)
+                        probe_row = self.table_scan_probe_targets.pop(tid, None)
+                        if probe_row:
+                            probe_url = str(probe_row.get("url") or "")
+                            if probe_url:
+                                self.table_scan_probe_urls.discard(probe_url)
                     self.session_targets.pop(child_sid, None)
+            except Exception:
+                pass
+            return
+
+        if method == "Network.webSocketCreated":
+            try:
+                url = str(params.get("url", "") or "")
+                if "dga." in url.lower() and "pragmatic" in url.lower():
+                    self._record_dga_config(ws_url=url, source="Chrome websocket created")
+            except Exception:
+                pass
+            return
+
+        if method in ("Network.webSocketFrameSent", "Network.webSocketFrameReceived"):
+            try:
+                response = params.get("response", {}) or {}
+                payload = str(response.get("payloadData", "") or "")
+                self._handle_dga_ws_payload(
+                    payload,
+                    sid=sid,
+                    direction="sent" if method.endswith("Sent") else "received",
+                )
             except Exception:
                 pass
             return
@@ -8465,7 +12377,28 @@ class ChromeBridge(threading.Thread):
                     except Exception:
                         table_id=""
 
-                    if (
+                    if self._is_collector_session(sid) and table_id:
+                        self.send(
+                            "Network.getResponseBody",
+                            {"requestId":req},
+                            session_id=sid,
+                            kind="directbody",
+                            context={
+                                "session": sid,
+                                "table_id": table_id,
+                                "operator_game_id": str(
+                                    self.session_operator_game.get(sid, "")
+                                ),
+                                "theme_code": str(
+                                    self.session_theme.get(sid, "")
+                                ),
+                                "title": str(
+                                    self.session_info.get(sid, {}).get("title", "")
+                                ),
+                                "collector": True,
+                            }
+                        )
+                    elif (
                         self._is_active_session(sid)
                         and table_id
                         and table_id == self.active_table_id
@@ -8476,6 +12409,7 @@ class ChromeBridge(threading.Thread):
                             session_id=sid,
                             kind="directbody",
                             context={
+                                "session": sid,
                                 "table_id":table_id,
                                 "operator_game_id":str(
                                     self.session_operator_game.get(sid,"")
@@ -8662,7 +12596,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.12 • Roulette Menu + Scroll Fix")
+        self.root.title("Roulette Pro AI V2.9.43 • AI Karar Motoru")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -8833,7 +12767,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.12 MENU+SCROLL",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.43 AI KARAR",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -8911,6 +12845,23 @@ class App:
         self.confidence.pack()
         self.quality_line = tk.Label(master,text="VERİ MODU: KAYNAKLAR KAYDEDİLİYOR",font=("Segoe UI",9,"bold"),fg=self.GREEN,bg=self.PANEL)
         self.quality_line.pack()
+        self.ai_line = tk.Label(
+            master,
+            text="AI KARAR: veri bekleniyor",
+            font=("Segoe UI",10,"bold"),
+            fg=self.YELLOW,
+            bg=self.PANEL,
+        )
+        self.ai_line.pack(pady=(3,0))
+        self.ai_reason_line = tk.Label(
+            master,
+            text="AI mevcut kaynakları tartıyor",
+            font=("Consolas",8,"bold"),
+            fg=self.MUTED,
+            bg=self.PANEL,
+            wraplength=390,
+        )
+        self.ai_reason_line.pack(pady=(0,2))
 
         # V2.8.8 - manual play helper only.
         # These buttons NEVER click the casino UI and NEVER place a bet.
@@ -8968,8 +12919,10 @@ class App:
             relief="flat",bd=0,padx=5,pady=1,cursor="hand2",
         ).pack(pady=(0,2))
 
+        # V2.9.21: old learned-route controls are hidden from the main screen.
+        # Widgets still exist for compatibility, but are not packed.
         teach_bar=tk.Frame(master,bg=self.PANEL)
-        teach_bar.pack(fill="x",padx=8,pady=(1,2))
+        # teach_bar.pack(fill="x",padx=8,pady=(1,2))
         tk.Button(
             teach_bar,
             text="ÖĞREN BAŞLAT",
@@ -9014,7 +12967,7 @@ class App:
             fg=self.BLUE,bg=self.PANEL,
             wraplength=390,
         )
-        self.lobby_teach_line.pack(pady=(0,1))
+        # self.lobby_teach_line.pack(pady=(0,1))
 
         self.chrome_link_line=tk.Label(
             master,
@@ -9023,7 +12976,7 @@ class App:
             fg=self.YELLOW,bg=self.PANEL,
             wraplength=390,
         )
-        self.chrome_link_line.pack(pady=(0,2))
+        # self.chrome_link_line.pack(pady=(0,2))
 
         self.top_last_line = tk.Label(master,text="SON: --",font=("Segoe UI",8,"bold"),fg=self.MUTED,bg=self.PANEL)
         self.top_last_line.pack(pady=(1,7))
@@ -9063,7 +13016,7 @@ class App:
         scan_bar=tk.Frame(data,bg=self.PANEL)
         scan_bar.pack(fill="x",padx=8,pady=(0,5))
         tk.Button(
-            scan_bar,text="PRAGMATIC MASALARI TARA",command=self.start_table_scan_ui,
+            scan_bar,text="DGA CANLI / MASALARI TARA",command=self.start_table_scan_ui,
             font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.GREEN,
             activebackground=self.PANEL2,activeforeground=self.GREEN,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
@@ -9072,6 +13025,32 @@ class App:
             scan_bar,text="TARAMAYI DURDUR",command=self.stop_table_scan_ui,
             font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.RED,
             activebackground=self.PANEL2,activeforeground=self.RED,
+            relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
+        ).pack(side="left",fill="x",expand=True,padx=(2,0))
+        tabwalk_bar=tk.Frame(data,bg=self.PANEL)
+        tabwalk_bar.pack(fill="x",padx=8,pady=(0,5))
+        tk.Button(
+            tabwalk_bar,text="TEK SEKME LOBİ TOPLA • 5 DK",command=self.start_tab_walk_scan_ui,
+            font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.BLUE,
+            activebackground=self.PANEL2,activeforeground=self.GREEN,
+            relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
+        ).pack(side="left",fill="x",expand=True,padx=(0,2))
+        tk.Label(
+            tabwalk_bar,text="masaları tek tek aç/kapat",font=("Segoe UI",7,"bold"),
+            bg=self.PANEL,fg=self.MUTED,
+        ).pack(side="left",fill="x",expand=True,padx=(2,0))
+        api_bar=tk.Frame(data,bg=self.PANEL)
+        api_bar.pack(fill="x",padx=8,pady=(0,5))
+        tk.Button(
+            api_bar,text="MASA API ÖĞREN",command=self.start_api_teach_ui,
+            font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.GREEN,
+            activebackground=self.PANEL2,activeforeground=self.GREEN,
+            relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
+        ).pack(side="left",fill="x",expand=True,padx=(0,2))
+        tk.Button(
+            api_bar,text="KAYITLI MASALARI DGA CANLI YENİLE",command=self.start_api_refresh_ui,
+            font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.YELLOW,
+            activebackground=self.PANEL2,activeforeground=self.GREEN,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
         ).pack(side="left",fill="x",expand=True,padx=(2,0))
         self.history_brain_line=tk.Label(data,text="Geçmiş sinyali bekleniyor...",font=("Consolas",8),justify="left",anchor="w",fg=self.TEXT,bg=self.PANEL,wraplength=380)
@@ -9097,7 +13076,13 @@ class App:
             font=("Consolas",8,"bold"),justify="left",anchor="w",
             fg=self.YELLOW,bg=self.PANEL,wraplength=380,
         )
-        self.locked_line.pack(fill="x",padx=8,pady=(0,6))
+        self.locked_line.pack(fill="x",padx=8,pady=(0,2))
+        self.risk_line=tk.Label(
+            perf,text="RİSK/EV: veri bekleniyor",
+            font=("Consolas",8,"bold"),justify="left",anchor="w",
+            fg=self.YELLOW,bg=self.PANEL,wraplength=380,
+        )
+        self.risk_line.pack(fill="x",padx=8,pady=(0,6))
 
         hist_shell,hist=self._detail_frame(); self.detail_frames["history"]=hist_shell
         top=tk.Frame(hist,bg=self.PANEL); top.pack(fill="x",padx=8,pady=(5,1))
@@ -9946,8 +13931,29 @@ class App:
     def start_table_scan_ui(self):
         self.bridge.start_table_scan()
 
+    def start_tab_walk_scan_ui(self):
+        self.bridge.start_tab_walk_scan(auto_cycle=True)
+
     def stop_table_scan_ui(self):
         self.bridge.stop_table_scan("kullanıcı durdurdu")
+
+    def start_api_refresh_ui(self):
+        self.bridge.start_api_refresh_all()
+
+    def start_api_teach_ui(self):
+        self.bridge.start_manual_api_teach()
+        try:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Masa API Öğren",
+                "Masa bankası sıfırlandı.\n\n"
+                "Şimdi tarayıcıda rulet masalarını tek tek sen aç.\n"
+                "Program her açtığın Pragmatic masanın tableId/API bilgisini "
+                "kaydedip SON500 verisini almaya çalışacak.\n\n"
+                "Bitince TARAMAYI DURDUR düğmesine basabilirsin."
+            )
+        except Exception:
+            pass
 
     def reset_lobby_teach_ui(self):
         self.bridge.reset_lobby_teaching()
@@ -10051,6 +14057,25 @@ class App:
                 text=f"VERİ MODU: KAYNAKLAR KAYDEDİLİYOR • WF {quality}",
                 fg=self.GREEN,
             )
+            ai = s.get("ai_decision") or {}
+            ai_action = str(ai.get("action") or "VERİ BEKLE")
+            ai_score = float(ai.get("score", 0.0) or 0.0)
+            ai_risk = str(ai.get("risk") or "-")
+            ai_pkg = str(ai.get("package") or "BEKLE")
+            ai_fg = (
+                self.GREEN if ai_action == "OYNA"
+                else self.BLUE if ai_action == "KONTROLLÜ"
+                else self.YELLOW if ai_action in ("İZLE", "VERİ BEKLE")
+                else self.RED
+            )
+            self.ai_line.config(
+                text=f"AI KARAR: {ai_action} • GÜVEN %{ai_score:.0f} • RİSK {ai_risk} • PAKET {ai_pkg}",
+                fg=ai_fg,
+            )
+            self.ai_reason_line.config(
+                text=(str(ai.get("explain") or "veri toplanıyor")[:180]),
+                fg=ai_fg if ai_action in ("OYNA", "KONTROLLÜ") else self.MUTED,
+            )
             cov = s.get("coverage") or {}
             self.coverage_line.config(text=(
                 f"TEORİK KAPSAMA • 1 sayı %{float(cov.get('single',0)):.1f} • "
@@ -10115,8 +14140,7 @@ class App:
                 f"CANLI SYNC: {s.get('source','-')}\n"
                 f"SON500 LIVE: SADECE DOĞRULANMIŞ +YENİ\n"
                 f"PUANLAMA: {s.get('score_error_status','OK')}\n"
-                f"{s.get('autorecover_status','AUTO KURTARMA: HAZIR')}\n"
-                f"{s.get('autolobby_status','AUTO LOBİ: HAZIR')}"
+                f"{s.get('autorecover_status','AUTO KURTARMA: HAZIR')}"
             ))
 
             sc = s.get("source_consensus") or {}
@@ -10323,6 +14347,55 @@ class App:
                     fg=self.YELLOW,
                 )
 
+            risk = s.get("risk_profile") or {}
+
+            def risk_text(row):
+                row = row or {}
+                label = str(row.get("label") or "-")
+                trials_r = int(row.get("trials", 0) or 0)
+                base = float(row.get("random_hit_pct", 0.0) or 0.0)
+                be = float(row.get("breakeven_hit_pct", 0.0) or 0.0)
+                cov_r = float(row.get("avg_coverage", 0.0) or 0.0)
+                if trials_r:
+                    hit = float(row.get("hit_rate_pct", 0.0) or 0.0)
+                    roi = float(row.get("roi_pct", 0.0) or 0.0)
+                    low = float(row.get("wilson_low90_pct", 0.0) or 0.0)
+                    return (
+                        f"{label}: K {cov_r:.1f}/37 • %{hit:.1f} "
+                        f"(alt90 %{low:.1f}) • BE %{be:.1f} • ROI {roi:+.1f}% • "
+                        f"{row.get('status','')}"
+                    )
+                return f"{label}: K {cov_r:.1f}/37 • taban %{base:.1f} • BE %{be:.1f}"
+
+            rnet = risk.get("net") or {}
+            rtop5 = risk.get("top5") or {}
+            rk1 = risk.get("k1") or {}
+            rk2 = risk.get("k2") or {}
+            risk_lines = [
+                "RİSK/EV: düz sayı 35:1 • rastgele uzun vade ROI -%2.70",
+                risk_text(rnet),
+                risk_text(rtop5),
+            ]
+            if int(rk1.get("trials", 0) or 0) or int(rk2.get("trials", 0) or 0):
+                risk_lines.append(risk_text(rk1))
+                risk_lines.append(risk_text(rk2))
+            else:
+                risk_lines.append("K1/K2: canlı paket ROI için doğrulanmış tur bekleniyor")
+
+            statuses = [
+                str(row.get("status") or "")
+                for row in (rnet, rtop5, rk1, rk2)
+                if int(row.get("trials", 0) or 0)
+            ]
+            self.risk_line.config(
+                text="\n".join(risk_lines),
+                fg=(
+                    self.GREEN if any("KANITLI" in x for x in statuses)
+                    else self.RED if statuses and all("TABAN ALTI" in x for x in statuses)
+                    else self.YELLOW
+                ),
+            )
+
             w = s.get("weights") or {}
             self.weight_line.config(text=(
                 f"Öğrenme: {s.get('learning_spins',0)} spin • "
@@ -10379,12 +14452,15 @@ class App:
             self.confidence.config(text="KAYNAK UYUMU: --")
             self.model_share.config(text="MODEL PAYI: --")
             self.quality_line.config(text="VERİ MODU: KAYNAKLAR KAYDEDİLİYOR", fg=self.GREEN)
+            self.ai_line.config(text="AI KARAR: veri bekleniyor", fg=self.YELLOW)
+            self.ai_reason_line.config(text="AI mevcut kaynakları tartıyor", fg=self.MUTED)
             self.stage_line.config(text="ÖĞRENME AŞAMASI: --")
             self.watch_list.config(text="Rulet masasını aç")
             self.validation_line.config(text="Henüz veri yok.")
             self.recent20_line.config(text="")
             self.walkforward_line.config(text="WALK-FORWARD: veri bekleniyor", fg=self.BLUE)
             self.locked_line.config(text="LOCKED LIVE 0/500 • yeni tur bekleniyor", fg=self.YELLOW)
+            self.risk_line.config(text="RİSK/EV: veri bekleniyor", fg=self.YELLOW)
             self.weight_line.config(text="")
             self.expert_line.config(text="")
 
@@ -10488,6 +14564,9 @@ class App:
             pmain = pending_cmp.get("predicted")
             pside = pending_cmp.get("side4") or []
             source_count = int(pending_cmp.get("source_count",0) or 0)
+            ai_action = str(pending_cmp.get("ai_action") or "AI")
+            ai_score = float(pending_cmp.get("ai_score",0.0) or 0.0)
+            ai_package = str(pending_cmp.get("ai_package") or "")
             current_batch = int(s.get("comparison_batch_count",0) or 0)
             next_no = 1 if current_batch >= 12 else current_batch + 1
 
@@ -10495,8 +14574,8 @@ class App:
                 text=(
                     f"BEKLEYEN #{next_no:02d} • NET {int(pmain):02d} • YEDEK "
                     + "/".join(f"{int(x):02d}" for x in pside)
-                    + f" • {source_count} kaynak/model kaydediliyor\n"
-                    "Yeni sonuç geldiğinde tüm kaynaklar ayrı ayrı puanlanacak."
+                    + f" • AI {ai_action} %{ai_score:.0f} {ai_package}\n"
+                    + f"{source_count} kaynak/model kaydediliyor • sonuç gelince AI de puanlanacak."
                 ),
                 fg=self.BLUE,
             )
@@ -10880,9 +14959,8 @@ def table_scan_self_test():
     assert PRAGMATIC_LOBBY_SCAN_URL == (
         "https://www.meritbet868.com/tr/live-casino/home"
         "?searchTerm=pragmatic+play+lobby"
-        "&openGames=3300922-real"
-        "&gameNames=Pragmatic%20Play%20Lobby"
     )
+    assert "pragmatic-lobby-card-play" in nav_script
     assert "open_card" not in nav_script
     assert "scrollTarget.scrollBy" in nav_script
     assert "roulette-selecting" in nav_script
@@ -10960,6 +15038,14 @@ def self_test():
     ext = external_web_expert([17, 34, 7], PUBLIC_AUTO_SEED_NEWEST)
     assert abs(sum(ext.values()) - 1.0) < 1e-9
     assert set(ext.keys()) == set(range(37))
+
+    # Risk/EV math: five straight-up numbers break even at 5/36,
+    # while random European coverage is 5/37 and ROI is -1/37 per stake unit.
+    rp = straight_up_risk_profile("T5", hits=14, trials=100, coverage=5)
+    assert abs(rp["random_hit_pct"] - (5/37*100)) < 1e-9
+    assert abs(rp["breakeven_hit_pct"] - (5/36*100)) < 1e-9
+    assert abs(rp["random_roi_pct"] + (100/37)) < 1e-9
+    assert rp["roi_pct"] > 0.0
 
     # V2.9.1 unattended recovery message tests.
     r1 = recovery_text_score("Bağlantı hatası. Lütfen sayfayı yenileyin.", ["Yenile"])

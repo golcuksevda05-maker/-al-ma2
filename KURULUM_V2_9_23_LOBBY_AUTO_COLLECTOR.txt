@@ -1,0 +1,23 @@
+ROULETTE PRO AI V2.9.23 LOBBY AUTO KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.23 LOBBY AUTO yazmalı.
+
+KULLANIM
+1. Pragmatic lobi veya bir rulet masası açıkken KAYITLI MASALARI API'DEN YENİLE'ye bas.
+2. API yöntemi OK verirse veriler API'den gelir.
+3. API OK 0 / HATA üretirse program otomatik lobi toplayıcıya geçer.
+4. Lobi toplayıcı masaları tek tek açıp SON500/statisticHistory verisini toplamaya çalışır.
+5. Döngü bitince 10 dakika sonra otomatik tekrar eder.
+6. Otomatik tekrarı durdurmak için TARAMAYI DURDUR'a bas.
+
+NOT
+- Her döngüde yeni gelen spinler uzun arşive eklenir; eski veriler tekrar
+  canlı sonuç gibi sayılmaz.

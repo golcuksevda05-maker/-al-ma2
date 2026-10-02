@@ -1,0 +1,26 @@
+ROULETTE PRO AI V2.9.19 API REFRESH KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.19 API REFRESH yazmalı.
+- VERİ panelinde şu yeni buton görünmeli:
+  KAYITLI MASALARI API'DEN YENİLE
+
+KULLANIM
+1. Önce normal şekilde bir Pragmatic rulet masası veya Pragmatic lobi açık
+   olsun ki program yetkili API şablonunu yakalasın.
+2. VERİ panelinden KAYITLI MASALARI API'DEN YENİLE butonuna bas.
+3. Durum satırında şuna benzer ilerleme görmelisin:
+   API TOPLA: 12/61 gönderildi • 6 aktif • 43 bekliyor
+
+NOT
+- Bu buton kayıtlı masa bankasını API'den hızlı yeniler.
+- Daha önce hiç tableId yakalanmamış yeni kartlar için hâlâ normal lobi tarama
+  gerekebilir.
+- BAT dosyasının adında V2_9_12 yazması normaldir.

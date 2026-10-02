@@ -1,0 +1,23 @@
+ROULETTE PRO AI V2.9.22 RUNTIME API KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.22 RUNTIME API yazmalı.
+- VERİ panelinde KAYITLI MASALARI API'DEN YENİLE butonu durmalı.
+
+KULLANIM
+1. Önce en az bir Pragmatic rulet masası açık olsun.
+2. KAYITLI MASALARI API'DEN YENİLE'ye bas.
+3. Durum satırında OK/HATA değerlerini izle:
+   API TOPLA: çalışıyor • OK X / HATA Y • 6 aktif • Z bekliyor
+
+NOT
+- Bu sürüm API isteklerini önce Chrome'un kendi Pragmatic context'i içinde
+  çalıştırır. Bu, Python urllib hatalarını azaltmak içindir.
+- Eğer eski banka şüpheliyse önce MASA API ÖĞREN ile temiz banka oluştur.

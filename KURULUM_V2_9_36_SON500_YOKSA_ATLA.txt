@@ -1,0 +1,21 @@
+ROULETTE PRO AI V2.9.36 SON500 YOKSA ATLA KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.36 SON500 ATLA yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+2. Program masaları tek yan sekmede gezmeye devam eder.
+3. SON500 olan masalarda veriyi kaydeder.
+4. SON500 olmayan masalarda kısa süre bekler, sonra 'SON500 yok • es geçiliyor' diyerek sıradaki masaya geçer.
+
+NOT
+- Bu sürüm özellikle bazı masalarda SON500 paneli olmadığı için takılmayı önlemek amacıyla yapıldı.

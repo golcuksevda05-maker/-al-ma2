@@ -1,0 +1,22 @@
+ROULETTE PRO AI V2.9.39 MASA KİLİT SON500 KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.39 MASA KİLİT yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+2. Program masaları tek yan sekmede gezer.
+3. Masa açıkken SON500 paneli varsa artık masa lobi sanılmaz; SON500 okunur.
+4. Masa açıkken SON500 paneli yoksa hemen atlanır.
+5. Lobiye dönünce sıradaki masaya geçer.
+
+NOT
+- Bu sürüm özellikle 'masada SON500 var ama program Rulet lobisi yazıp bekliyor' sorunu için yapıldı.

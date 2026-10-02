@@ -1,0 +1,22 @@
+ROULETTE PRO AI V2.9.35 HIZLI LOBİ DEVAM KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.35 HIZLI LOBİ yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+2. Program masa kartını açar ve sağ-alt SON500 panelini kaydeder.
+3. Veri sonrası sağ üst oyun içi Lobi düğmesine basar.
+4. Pragmatic Rulet lobisi görünür görünmez bekleme kilidini temizler.
+5. Sıradaki masaya daha hızlı geçer.
+
+NOT
+- Bu sürüm özellikle 'lobiye geldi ama sağ-alt SON500 okunuyor/bulunan 0 diye takıldı' ve 'masa geçişleri hızlansın' isteği için yapıldı.

@@ -1,0 +1,27 @@
+ROULETTE PRO AI V2.9.15 SAFE SCAN KURULUM
+
+BU SÜRÜM NE İÇİN?
+- Siyah Pragmatic Play Lobby sekmelerinin açılıp takılı kalmasını engeller.
+- Masa taramasında ekstra gizli sekme açmayı kapatır.
+- Eski kayıtlı banka sayısı ile bu taramada bulunan gerçek masa ID sayısını
+  ayrı gösterir.
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları kendi program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Eğer Chrome'da eski güncellemeden kalmış siyah Pragmatic Play Lobby
+   sekmeleri varsa kapat.
+5. Programı şu dosya ile çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Program üstünde V2.9.15 SAFE SCAN yazmalı.
+- MASA TARAMA satırında "gizli sekme açma kapalı" görünmeli.
+- Satır şu mantıkla okunmalı:
+  kart = lobide görülen rulet kartı
+  bu taramada gerçek masa ID = bu tarama sırasında gerçekten tanınan tableId
+  kayıtlı banka = daha önce kaydedilmiş masa bankası
+
+NOT
+- BAT dosyasının adında V2_9_12 kalması normaldir.

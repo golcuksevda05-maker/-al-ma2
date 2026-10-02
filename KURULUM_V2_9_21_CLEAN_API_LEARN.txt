@@ -1,0 +1,29 @@
+ROULETTE PRO AI V2.9.21 CLEAN API KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.21 CLEAN API yazmalı.
+- Ana ekrandaki eski ÖĞREN BAŞLAT / ÖĞREN BİTİR / YOLU BAŞLAT satırı görünmemeli.
+- VERİ panelinde şu iki buton kalmalı:
+  * MASA API ÖĞREN
+  * KAYITLI MASALARI API'DEN YENİLE
+
+TEMİZ BANKA İÇİN ÖNERİLEN AKIŞ
+1. MASA API ÖĞREN'e bas.
+   Eski banka sıfırlanır.
+2. Rulet masalarını tek tek sen aç.
+   Program yalnız gerçekten açtığın masaları bankaya ekler.
+3. Bitince TARAMAYI DURDUR'a bas.
+4. KAYITLI MASALARI API'DEN YENİLE'ye bas.
+   Durumda OK/HATA ve aktif/bekleyen sayıları görünür.
+
+NOT
+- Eski 40/61 gibi fazla kayıt görünüyorsa MASA API ÖĞREN ile bankayı yeniden
+  temiz öğretmek gerekir.
+- BAT dosyasının adında V2_9_12 yazması normaldir.
